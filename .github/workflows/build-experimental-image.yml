@@ -353,7 +353,8 @@ jobs:
           if docker buildx imagetools inspect "$IMAGE:$IMAGE_TAG" > "$RUNNER_TEMP/existing-tag-check.txt" 2>&1; then
             echo "The requested image tag already exists; refusing to overwrite it." >&2
             exit 1
-          elif ! grep -Eiq 'manifest unknown|no such manifest|manifest.*not found|404 Not Found' "$RUNNER_TEMP/existing-tag-check.txt"; then
+          elif ! grep -Eiq 'manifest unknown|no such manifest|manifest.*not found|404 Not Found' "$RUNNER_TEMP/existing-tag-check.txt" \
+            && ! grep -Fqx "ERROR: $IMAGE:$IMAGE_TAG: not found" "$RUNNER_TEMP/existing-tag-check.txt"; then
             cat "$RUNNER_TEMP/existing-tag-check.txt" >&2
             echo "Could not prove the requested tag is unused; stopping before push." >&2
             exit 1
