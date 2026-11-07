@@ -108,6 +108,12 @@ jobs:
             exit 1
           fi
           cp -a dist "$production_web"
+          manifest_paths="$(find "$production_web" -type f -name site.webmanifest -print)"
+          if [[ -n "$manifest_paths" ]]; then
+            printf 'Production manifest candidate paths:\n%s\n' "$manifest_paths"
+          else
+            echo "Production manifest candidate paths: <none>"
+          fi
           npm run e2e:build
 
       - name: Execute Playwright E2E suite on desktop and mobile projects
