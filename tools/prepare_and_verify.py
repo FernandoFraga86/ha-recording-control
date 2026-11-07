@@ -122,9 +122,11 @@ def prepare(args: argparse.Namespace) -> None:
 
     overlay = distribution / lock["patches"]["source_overlay"]["path"]
     branding = distribution / lock["patches"]["distribution_branding"]["path"]
+    build_source = distribution / lock["patches"]["distribution_build_source"]["path"]
     for patch_path, patch_key in (
         (overlay, "source_overlay"),
         (branding, "distribution_branding"),
+        (build_source, "distribution_build_source"),
     ):
         expected_hash = lock["patches"][patch_key]["sha256"]
         actual_hash = sha256(patch_path)
@@ -142,6 +144,15 @@ def prepare(args: argparse.Namespace) -> None:
         lock["removed_visual_assets"]
     )
     assert_paths(source, overlay_paths | branding_paths, "combined distribution")
+
+    run(["git", "apply", "--check", str(build_source)], cwd=source)
+    run(["git", "apply", str(build_source)], cwd=source)
+    build_source_paths = set(lock["build_source_paths"])
+    assert_paths(
+        source,
+        overlay_paths | branding_paths | build_source_paths,
+        "combined distribution and build-source mirror",
+    )
     run(["git", "diff", "--check", "HEAD"], cwd=source)
 
     for relative, expected_hash in lock["runtime_sha256_lf"].items():
@@ -199,6 +210,7 @@ def prepare(args: argparse.Namespace) -> None:
                 "overlay_files": len(overlay_paths),
                 "runtime_hashes": len(lock["runtime_sha256_lf"]),
                 "branding_hashes": len(lock["branding_files_sha256_lf"]),
+                "build_source_paths": sorted(build_source_paths),
                 "removed_visual_assets": len(lock["removed_visual_assets"]),
                 "license_files": lock["required_attribution_files"],
                 "image_tag": lock["candidate_version"],

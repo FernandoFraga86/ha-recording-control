@@ -20,7 +20,18 @@
     "patch_sha256": "512f404a274aeb11a3e26246cddae48a62539cc01ccb10d6a297c5ea42221b65",
     "branding_variant": "rebrand1",
     "branding_patch_path": "patches/distribution-branding-rebrand1.patch",
-    "branding_patch_sha256": "35dddbc08947abb8db1b97e7faeb4855d323f8f0fa722db9756afcf20a2e0a6a"
+    "branding_patch_sha256": "35dddbc08947abb8db1b97e7faeb4855d323f8f0fa722db9756afcf20a2e0a6a",
+    "build_source_patch_path": "patches/distribution-build-source-fallback-1.patch",
+    "build_source_patch_sha256": "bd40dc656890633e817076e0d5262f787eaec133d1264c3ae5d07ea5fb9ea897",
+    "nginx_vod_source": {
+      "version": "1.31",
+      "archive": "kaltura-nginx-vod-module-1.31_GH0.tar.gz",
+      "url": "https://download.freebsd.org/ports/distfiles/kaltura-nginx-vod-module-1.31_GH0.tar.gz",
+      "sha256": "ace04201cf2d2b1a3e5e732a22b92225b8ce61a494df9cc7f79d97efface8952",
+      "size_bytes": 470904,
+      "checksum_reference": "https://cgit.freebsd.org/ports/tree/www/nginx/distinfo?id=b0b3e488f56e0899977a8e2e184a7338f3f6a2ae",
+      "verified_by_remote_build": false
+    }
   },
   "image": {
     "visibility_intended": "public",

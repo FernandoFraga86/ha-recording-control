@@ -16,6 +16,10 @@
     "distribution_branding": {
       "path": "patches/distribution-branding-rebrand1.patch",
       "sha256": "35dddbc08947abb8db1b97e7faeb4855d323f8f0fa722db9756afcf20a2e0a6a"
+    },
+    "distribution_build_source": {
+      "path": "patches/distribution-build-source-fallback-1.patch",
+      "sha256": "bd40dc656890633e817076e0d5262f787eaec133d1264c3ae5d07ea5fb9ea897"
     }
   },
   "overlay_paths": [
@@ -55,6 +59,9 @@
     "web/public/notifications-worker.js": "2f1c7ac2d3d3f908a36c10bc732aaea15ab265b362119112049eb8059a8740fd",
     "web/public/images/ha-recording-control.svg": "96233ae44e9f8200b9c1917c8db2cc90267336feadd1a0dedc4b278884af2090"
   },
+  "build_source_paths": [
+    "docker/main/build_nginx.sh"
+  ],
   "removed_visual_assets": [
     "web/images/branding/apple-touch-icon.png",
     "web/images/branding/favicon-16x16.png",

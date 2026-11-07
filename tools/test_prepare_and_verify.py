@@ -6,6 +6,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import subprocess
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -176,6 +177,51 @@ class DistributionVerificationTests(unittest.TestCase):
         )
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.run_layer_check(archive, distribution)
+
+    def test_distribution_build_source_patch_is_locked_and_applies_narrowly(self) -> None:
+        lock = json.loads(
+            (REPOSITORY / "candidate-verification.json").read_text(encoding="utf-8")
+        )
+        patch_entry = lock["patches"]["distribution_build_source"]
+        patch_path = REPOSITORY / patch_entry["path"]
+        self.assertEqual(
+            hashlib.sha256(patch_path.read_bytes()).hexdigest(), patch_entry["sha256"]
+        )
+        patch_text = patch_path.read_text(encoding="utf-8")
+        self.assertIn("https://download.freebsd.org/ports/distfiles/", patch_text)
+        self.assertIn(
+            "ace04201cf2d2b1a3e5e732a22b92225b8ce61a494df9cc7f79d97efface8952",
+            patch_text,
+        )
+        self.assertIn('VOD_MODULE_ARCHIVE_SIZE="470904"', patch_text)
+
+        with tempfile.TemporaryDirectory(dir=TOOLS) as temporary:
+            root = Path(temporary)
+            script = root / "docker/main/build_nginx.sh"
+            script.parent.mkdir(parents=True)
+            original_block = [
+                "mkdir /tmp/nginx-vod-module",
+                "wget -nv https://github.com/kaltura/nginx-vod-module/archive/refs/tags/${VOD_MODULE_VERSION}.tar.gz",
+                "tar -zxf ${VOD_MODULE_VERSION}.tar.gz -C /tmp/nginx-vod-module --strip-components=1",
+                "rm ${VOD_MODULE_VERSION}.tar.gz",
+            ]
+            script.write_text(
+                "".join(f"# context {index}\n" for index in range(32))
+                + "\n".join(original_block)
+                + "\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "apply", "--check", str(patch_path)], cwd=root, check=True
+            )
+            subprocess.run(["git", "apply", str(patch_path)], cwd=root, check=True)
+            patched_script = script.read_text(encoding="utf-8")
+            self.assertIn('sha256sum --check', patched_script)
+            self.assertNotIn(
+                "https://github.com/kaltura/nginx-vod-module/archive/refs/tags/",
+                patched_script,
+            )
 
 
 if __name__ == "__main__":

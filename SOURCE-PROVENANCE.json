@@ -16,6 +16,20 @@
     "removed_visual_assets_count": 12,
     "licenses_and_attribution_retained": true
   },
+  "build_source_fallback": {
+    "scope": "build-time source acquisition only; no Frigate runtime logic changed",
+    "upstream_file": "docker/main/build_nginx.sh",
+    "module": "kaltura/nginx-vod-module",
+    "version": "1.31",
+    "archive": "kaltura-nginx-vod-module-1.31_GH0.tar.gz",
+    "url": "https://download.freebsd.org/ports/distfiles/kaltura-nginx-vod-module-1.31_GH0.tar.gz",
+    "sha256": "ace04201cf2d2b1a3e5e732a22b92225b8ce61a494df9cc7f79d97efface8952",
+    "size_bytes": 470904,
+    "checksum_reference_repository": "https://cgit.freebsd.org/ports",
+    "checksum_reference_commit": "b0b3e488f56e0899977a8e2e184a7338f3f6a2ae",
+    "checksum_reference_path": "www/nginx/distinfo",
+    "remote_download_hash_verified": false
+  },
   "candidate_version": "0.18.2-recording-control-1ca90f8-rebrand1",
   "image": {
     "repository": "ghcr.io/fernandofraga86/ha-recording-control",
