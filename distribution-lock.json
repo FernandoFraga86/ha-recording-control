@@ -22,7 +22,7 @@
     "branding_patch_path": "patches/distribution-branding-rebrand1.patch",
     "branding_patch_sha256": "35dddbc08947abb8db1b97e7faeb4855d323f8f0fa722db9756afcf20a2e0a6a",
     "build_source_patch_path": "patches/distribution-build-source-fallback-1.patch",
-    "build_source_patch_sha256": "7116976ccf59ae3ecdbe1ebb752039d6f2f455f77993c96318617e0a5e9cbda1",
+    "build_source_patch_sha256": "c805a3fe5395a5b18d28a398f32b9c98c49e3158ef2639a850c2c610fbad9bf7",
     "nginx_vod_source": {
       "version": "1.31",
       "archive": "kaltura-nginx-vod-module-1.31_GH0.tar.gz",

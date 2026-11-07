@@ -19,7 +19,7 @@
     },
     "distribution_build_source": {
       "path": "patches/distribution-build-source-fallback-1.patch",
-      "sha256": "7116976ccf59ae3ecdbe1ebb752039d6f2f455f77993c96318617e0a5e9cbda1"
+      "sha256": "c805a3fe5395a5b18d28a398f32b9c98c49e3158ef2639a850c2c610fbad9bf7"
     }
   },
   "overlay_paths": [
