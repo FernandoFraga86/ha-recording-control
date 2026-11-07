@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "candidate_version": "0.18.2-recording-control-1ca90f8-rebrand1",
+  "candidate_version": "0.18.2-recording-control-1ca90f8-rebrand1-rootfs1",
   "upstream": {
     "repository": "https://github.com/blakeblackshear/frigate",
     "commit": "cfa08c56b23d23280c3d0a218e5a43182c97445b"
@@ -8,6 +8,14 @@
   "distribution_repository": "FernandoFraga86/ha-recording-control",
   "image_repository": "ghcr.io/fernandofraga86/ha-recording-control",
   "image_platform": "linux/amd64",
+  "official_image_base": {
+    "tag_reference": "ghcr.io/blakeblackshear/frigate:0.18.2",
+    "index_digest": "sha256:fd60f99ffd4eb6c42360ed4e14953e270586f239309ab3983e55b2e97ffac09a",
+    "platform_reference": "ghcr.io/blakeblackshear/frigate@sha256:9ebab4801be69ab4ebc7f6ab1d582c859ff7412d457a3fa550056894e8444dad",
+    "linux_amd64_manifest_digest": "sha256:9ebab4801be69ab4ebc7f6ab1d582c859ff7412d457a3fa550056894e8444dad",
+    "config_digest": "sha256:d8c79fd30635c830c5972dbc61c8c6c789af2373c654e7f4de1073eef435c982",
+    "upstream_commit": "cfa08c56b23d23280c3d0a218e5a43182c97445b"
+  },
   "patches": {
     "source_overlay": {
       "path": "patches/recording-control-0.18.2.patch",

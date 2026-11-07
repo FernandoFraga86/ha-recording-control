@@ -1,6 +1,6 @@
 {
-  "schema": 2,
-  "artifact_kind": "source-patch-and-experimental-build-workflow",
+  "schema": 3,
+  "artifact_kind": "source-patch-and-flattened-official-image-build-workflow",
   "upstream_repository": "https://github.com/blakeblackshear/frigate",
   "upstream_release": "0.18.2",
   "upstream_base_commit": "cfa08c56b23d23280c3d0a218e5a43182c97445b",
@@ -12,7 +12,8 @@
     "patch_path": "patches/distribution-branding-rebrand1.patch",
     "patch_sha256": "35dddbc08947abb8db1b97e7faeb4855d323f8f0fa722db9756afcf20a2e0a6a",
     "identity": "HA Recording Control",
-    "candidate_version": "0.18.2-recording-control-1ca90f8-rebrand1",
+    "candidate_version": "0.18.2-recording-control-1ca90f8-rebrand1-rootfs1",
+    "image_distribution_variant": "rebrand1-rootfs1",
     "removed_visual_assets_count": 12,
     "licenses_and_attribution_retained": true
   },
@@ -47,14 +48,24 @@
       "freebsd_distcache_candidate": "HTTP 404"
     },
     "verified_alternate_source": null,
-    "status": "blocked; no substitute source or hash accepted"
+    "status": "direct-source-build dependency unavailable; not used by the digest-pinned official-image strategy",
+    "runtime_validation": "pending against the official image and active Nginx configuration"
   },
-  "candidate_version": "0.18.2-recording-control-1ca90f8-rebrand1",
+  "candidate_version": "0.18.2-recording-control-1ca90f8-rebrand1-rootfs1",
   "image": {
     "repository": "ghcr.io/fernandofraga86/ha-recording-control",
-    "tag": "0.18.2-recording-control-1ca90f8-rebrand1",
+    "tag": "0.18.2-recording-control-1ca90f8-rebrand1-rootfs1",
     "platform": "linux/amd64",
     "intended_visibility": "public",
+    "build_strategy": "flattened-rootfs-from-digest-pinned-official-frigate-image",
+    "base_image": {
+      "tag_reference": "ghcr.io/blakeblackshear/frigate:0.18.2",
+      "index_digest": "sha256:fd60f99ffd4eb6c42360ed4e14953e270586f239309ab3983e55b2e97ffac09a",
+      "platform_reference": "ghcr.io/blakeblackshear/frigate@sha256:9ebab4801be69ab4ebc7f6ab1d582c859ff7412d457a3fa550056894e8444dad",
+      "linux_amd64_manifest_digest": "sha256:9ebab4801be69ab4ebc7f6ab1d582c859ff7412d457a3fa550056894e8444dad",
+      "config_digest": "sha256:d8c79fd30635c830c5972dbc61c8c6c789af2373c654e7f4de1073eef435c982",
+      "upstream_commit": "cfa08c56b23d23280c3d0a218e5a43182c97445b"
+    },
     "published": false,
     "oci_digest": null,
     "production_ready": false,

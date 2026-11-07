@@ -1,6 +1,6 @@
 # TEMPLATE ONLY. Do not rename to config.yaml or install.
 name: HA Recording Control (Experimental)
-version: "0.18.2-recording-control-1ca90f8-rebrand1"
+version: "0.18.2-recording-control-1ca90f8-rebrand1-rootfs1"
 breaking_versions:
   - "0.18.0"
   - "0.17.0"
