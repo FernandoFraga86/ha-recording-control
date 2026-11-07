@@ -108,7 +108,7 @@ jobs:
             exit 1
           fi
           cp -a dist "$production_web"
-          cp web/site.webmanifest "$production_web/site.webmanifest"
+          cp site.webmanifest "$production_web/site.webmanifest"
           manifest_paths="$(find "$production_web" -type f -name site.webmanifest -print)"
           if [[ -n "$manifest_paths" ]]; then
             printf 'Production manifest candidate paths:\n%s\n' "$manifest_paths"
