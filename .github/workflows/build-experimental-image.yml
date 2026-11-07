@@ -108,6 +108,7 @@ jobs:
             exit 1
           fi
           cp -a dist "$production_web"
+          cp web/site.webmanifest "$production_web/site.webmanifest"
           manifest_paths="$(find "$production_web" -type f -name site.webmanifest -print)"
           if [[ -n "$manifest_paths" ]]; then
             printf 'Production manifest candidate paths:\n%s\n' "$manifest_paths"
@@ -144,7 +145,7 @@ jobs:
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --label "org.opencontainers.image.description=Experimental HA Recording Control distribution based on Frigate 0.18.2" \
             --label "io.ha-recording-control.source-overlay-sha256=512f404a274aeb11a3e26246cddae48a62539cc01ccb10d6a297c5ea42221b65" \
-            --label "io.ha-recording-control.branding-patch-sha256=2df652c30405562f1884dbb4dc0982395e20b61285952b62b543487210bd855d" \
+            --label "io.ha-recording-control.branding-patch-sha256=35dddbc08947abb8db1b97e7faeb4855d323f8f0fa722db9756afcf20a2e0a6a" \
             --file docker/main/Dockerfile \
             upstream
 
@@ -229,8 +230,11 @@ jobs:
               exit 1
             fi
             if response="$(docker exec "$container_name" curl --fail --silent --show-error http://127.0.0.1:5000/api/version 2>/dev/null)"; then
+              manifest_response="$(docker exec "$container_name" curl --fail --silent --show-error http://127.0.0.1:5000/site.webmanifest)"
+              printf '%s' "$manifest_response" | python3 -c 'import json, sys; manifest=json.load(sys.stdin); assert manifest.get("name") == "HA Recording Control" and manifest.get("short_name") == "HA Recording Control"'
               printf 'Synthetic isolated API response: %s\n' "$response"
-              printf '%s\n' "Image smoke-start passed: Frigate API answered `/api/version` under `--network none` with an empty synthetic camera configuration." >> "$GITHUB_STEP_SUMMARY"
+              echo "Synthetic isolated web manifest: $manifest_response"
+              printf '%s\n' "Image smoke-start passed: Frigate API answered `/api/version`, and `/site.webmanifest` returned the neutral app identity under `--network none` with an empty synthetic camera configuration." >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
             sleep 5

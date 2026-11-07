@@ -15,7 +15,7 @@
     },
     "distribution_branding": {
       "path": "patches/distribution-branding-rebrand1.patch",
-      "sha256": "2df652c30405562f1884dbb4dc0982395e20b61285952b62b543487210bd855d"
+      "sha256": "35dddbc08947abb8db1b97e7faeb4855d323f8f0fa722db9756afcf20a2e0a6a"
     }
   },
   "overlay_paths": [
@@ -47,7 +47,7 @@
     "frigate/video/ffmpeg.py": "a4ca5165aa46843a58be42f1ca3b9d7f9924c2061a7d13b8c8bbb17c0e926361"
   },
   "branding_files_sha256_lf": {
-    "docker/main/Dockerfile": "3d6c88c15d51abeceb3bb9d684eacb5f40061f9b120dbf943b2863eeb58001d3",
+    "docker/main/Dockerfile": "ce5ace6449ec2442b095c2f1b4e9dac2a192533fb09d2238fbf3d858cfd8fd12",
     "web/index.html": "bea6550c973568b712098c5ac31721b0b7c683aa0a934d678b39d3852c0f9bb9",
     "web/login.html": "39ddeab69f71f4b203d7f3969616202f395aaa24108754b106ad830d51878a5a",
     "web/site.webmanifest": "95a039440eb525615bbd3e107cd1ffadf3a73b6967488d5326464f4cae700946",

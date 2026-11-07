@@ -10,7 +10,7 @@
   "patch_sha256": "512f404a274aeb11a3e26246cddae48a62539cc01ccb10d6a297c5ea42221b65",
   "branding_variant": {
     "patch_path": "patches/distribution-branding-rebrand1.patch",
-    "patch_sha256": "2df652c30405562f1884dbb4dc0982395e20b61285952b62b543487210bd855d",
+    "patch_sha256": "35dddbc08947abb8db1b97e7faeb4855d323f8f0fa722db9756afcf20a2e0a6a",
     "identity": "HA Recording Control",
     "candidate_version": "0.18.2-recording-control-1ca90f8-rebrand1",
     "removed_visual_assets_count": 12,

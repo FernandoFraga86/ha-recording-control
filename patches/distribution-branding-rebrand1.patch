@@ -1,14 +1,15 @@
 diff --git a/docker/main/Dockerfile b/docker/main/Dockerfile
-index bf17146..f102c22 100644
+index bf17146..3d01ea4 100644
 --- a/docker/main/Dockerfile
 +++ b/docker/main/Dockerfile
-@@ -356,6 +356,9 @@ FROM scratch AS rootfs
+@@ -356,6 +356,10 @@ FROM scratch AS rootfs
  WORKDIR /opt/frigate/
  COPY frigate frigate/
  COPY migrations migrations/
 +COPY LICENSE licenses/UPSTREAM-MIT-LICENSE
 +COPY TRADEMARK.md licenses/UPSTREAM-TRADEMARK-POLICY.md
 +COPY web/images/branding/LICENSE licenses/UPSTREAM-WEB-BRAND-ASSETS-LICENSE
++COPY web/site.webmanifest web/site.webmanifest
  COPY --from=web-build /work/dist/ web/
  
  # Frigate final container
