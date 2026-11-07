@@ -9,13 +9,35 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tools.integrated_service_lab import docker_result, inspect_optional, validate_runner_temp_root
+from tools.integrated_service_lab import (
+    docker_result,
+    inspect_optional,
+    validate_runner_temp_root,
+    wait_frigate_api,
+)
+from tools.integrated_lab.frigate_version import parse_frigate_version
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class IntegratedLabMetadataTests(unittest.TestCase):
+    def test_frigate_version_parser_accepts_the_official_plain_text_api_body(self) -> None:
+        self.assertEqual(parse_frigate_version("0.18.2\n"), "0.18.2")
+
+    def test_frigate_version_parser_rejects_json_and_unexpected_bodies(self) -> None:
+        for body in ('{"version":"0.18.2"}', "0.19.0", "not ready"):
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                parse_frigate_version(body)
+
+    @patch("tools.integrated_service_lab.require_running")
+    @patch("tools.integrated_service_lab.docker_result")
+    def test_runner_frigate_probe_accepts_plain_text_api_response(self, run, require_running) -> None:
+        run.return_value.returncode = 0
+        run.return_value.stdout = '"0.18.2"\n'
+        self.assertEqual(wait_frigate_api("synthetic-frigate", timeout=1), {"version": "0.18.2"})
+        require_running.assert_called_once_with("synthetic-frigate")
+
     def test_temp_cleanup_accepts_only_a_direct_child_with_the_run_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -132,6 +154,8 @@ class IntegratedLabMetadataTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('BASE + "/api/"', smoke)
+        self.assertIn("from frigate_version import parse_frigate_version", smoke)
+        self.assertIn('session.get("http://frigate:5000/api/version")', smoke)
 
 
 if __name__ == "__main__":

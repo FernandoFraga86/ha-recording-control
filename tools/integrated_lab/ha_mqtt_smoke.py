@@ -10,6 +10,7 @@ import sys
 import time
 
 import aiohttp
+from frigate_version import parse_frigate_version
 
 
 BASE = "http://127.0.0.1:8123"
@@ -185,12 +186,14 @@ async def main(run_id: str) -> None:
         api_deadline = time.monotonic() + 180
         while time.monotonic() < api_deadline:
             try:
-                status, data = await request_json(session, "GET", "http://frigate:5000/api/version")
-                if status == 200 and isinstance(data, dict):
-                    version = str(data.get("version", ""))
-                    if not version.startswith("0.18"):
-                        raise RuntimeError("Core reached an unexpected Frigate API version")
-                    frigate_version = version
+                async with session.get("http://frigate:5000/api/version") as response:
+                    status = response.status
+                    body = await response.text()
+                if status == 200:
+                    try:
+                        frigate_version = parse_frigate_version(body)
+                    except ValueError as error:
+                        raise RuntimeError("Core reached an unexpected Frigate API version") from error
                     break
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 pass

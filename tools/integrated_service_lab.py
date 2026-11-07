@@ -13,6 +13,8 @@ import tempfile
 import time
 from typing import Any
 
+from tools.integrated_lab.frigate_version import parse_frigate_version
+
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCK_PATH = ROOT / "distribution-lock.json"
@@ -133,9 +135,11 @@ def write_lab_configs(root: Path, run_id: str) -> tuple[Path, Path, Path]:
         encoding="utf-8",
     )
     helper = ROOT / "tools" / "integrated_lab" / "ha_mqtt_smoke.py"
-    if not helper.is_file():
-        raise RuntimeError("Home Assistant MQTT smoke helper is missing")
+    version_helper = ROOT / "tools" / "integrated_lab" / "frigate_version.py"
+    if not helper.is_file() or not version_helper.is_file():
+        raise RuntimeError("Home Assistant lab helper is missing")
     (control_dir / "ha_mqtt_smoke.py").write_bytes(helper.read_bytes())
+    (control_dir / "frigate_version.py").write_bytes(version_helper.read_bytes())
     return broker_dir, ha_dir, frigate_dir
 
 
@@ -260,7 +264,7 @@ def wait_frigate_api(name: str, timeout: int = 240) -> dict[str, Any]:
     probe = (
         "import json,urllib.request; "
         "r=urllib.request.urlopen('http://127.0.0.1:5000/api/version',timeout=4); "
-        "print(json.dumps(json.load(r)))"
+        "print(json.dumps(r.read().decode('utf-8').strip()))"
     )
     deadline = time.monotonic() + timeout
     last = "not yet available"
@@ -268,11 +272,11 @@ def wait_frigate_api(name: str, timeout: int = 240) -> dict[str, Any]:
         require_running(name)
         result = docker_result("exec", name, "python3", "-c", probe, capture=True)
         if result.returncode == 0:
-            data = json.loads(result.stdout)
-            version = str(data.get("version", ""))
-            if not version.startswith("0.18"):
-                raise RuntimeError(f"Frigate API returned unexpected version: {version!r}")
-            return data
+            try:
+                version = parse_frigate_version(json.loads(result.stdout))
+            except (json.JSONDecodeError, TypeError, ValueError) as error:
+                raise RuntimeError("Frigate API returned an unexpected version response") from error
+            return {"version": version}
         last = (result.stdout or "")[-500:]
         time.sleep(3)
     raise RuntimeError(f"Frigate /api/version did not become ready: {last}")
