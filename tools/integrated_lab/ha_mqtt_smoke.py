@@ -212,16 +212,35 @@ async def main(run_id: str) -> None:
                 token=token,
             )
             if status == 200 and isinstance(states, list):
+                matches: list[tuple[str, str | None]] = []
                 for state in states:
                     if not isinstance(state, dict):
                         continue
                     attrs = state.get("attributes")
+                    current_entity_id = state.get("entity_id")
+                    friendly_name = attrs.get("friendly_name") if isinstance(attrs, dict) else None
+                    if (
+                        isinstance(current_entity_id, str)
+                        and "ci_frigate_mqtt_probe" in current_entity_id
+                    ) or (
+                        isinstance(friendly_name, str)
+                        and friendly_name.startswith("CI Frigate MQTT Probe ")
+                    ):
+                        matches.append((str(current_entity_id), str(state.get("state"))))
                     if state.get("entity_id") == entity_id or (
                         isinstance(attrs, dict)
                         and attrs.get("friendly_name") == "CI Frigate MQTT Probe " + run_id
                     ):
                         observed = str(state.get("state"))
                         break
+                CURRENT_DIAGNOSTIC = (
+                    f"http_status={status}; states_count={len(states)}; "
+                    f"target_entity={entity_id}; matching_synthetic_entities={matches[:5]!r}"
+                )
+            else:
+                CURRENT_DIAGNOSTIC = (
+                    f"http_status={status}; states_payload_type={type(states).__name__}"
+                )
             if observed == "synthetic_event_received":
                 write_status(
                     "passed",
