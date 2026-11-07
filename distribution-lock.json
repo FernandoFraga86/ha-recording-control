@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "status": "EXPERIMENTAL_SOURCE_ONLY_NOT_INSTALLABLE",
+  "production_ready": false,
+  "repository_url": "https://github.com/FernandoFraga86/ha-recording-control",
+  "app": {
+    "slug": "recording_control",
+    "stage": "experimental",
+    "boot": "manual",
+    "target_supervisor_version": "2026.10.5",
+    "target_architecture": "amd64",
+    "target_validation_complete": false
+  },
+  "source": {
+    "upstream_release": "0.18.2",
+    "upstream_base_commit": "cfa08c56b23d23280c3d0a218e5a43182c97445b",
+    "candidate_commit": "1ca90f845603cd30e1dd241fd9e3ce6506a36841",
+    "overlay_sha256": "acc70d496dc667a2b44241b4bf527d6d8e8fe08a2e47d32ff4667598d45ff6be",
+    "patch_sha256": "512f404a274aeb11a3e26246cddae48a62539cc01ccb10d6a297c5ea42221b65"
+  },
+  "image": {
+    "visibility_intended": "public",
+    "repository": "ghcr.io/fernandofraga86/ha-recording-control",
+    "version_tag": "0.18.2-recording-control-1ca90f8",
+    "published": false,
+    "registry_tag_immutability_verified": false,
+    "oci_index_digest": null,
+    "platform_digest_amd64": null
+  },
+  "installable": false,
+  "blocking_gates": [
+    "container image not published and OCI digest not verified",
+    "target Supervisor load/install validation pending",
+    "startup recovery and privacy acceptance validation pending",
+    "branding review for any runnable derivative pending"
+  ]
+}

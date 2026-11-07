@@ -1,0 +1,74 @@
+# TEMPLATE ONLY. Do not rename to config.yaml or install.
+name: Recording Control for Frigate (Experimental)
+version: "0.18.2-recording-control-1ca90f8"
+breaking_versions:
+  - "0.18.0"
+  - "0.17.0"
+  - "0.16.0"
+  - "0.15.0"
+  - "0.14.0"
+panel_icon: "mdi:cctv"
+panel_title: Recording Control
+slug: recording_control
+description: Unofficial experimental recording-control integration; not validated for installation.
+url: "https://github.com/FernandoFraga86/ha-recording-control"
+stage: experimental
+image: "ghcr.io/fernandofraga86/ha-recording-control"
+startup: application
+# Staging-only: manual prevents automatic startup until recovery is validated.
+boot: manual
+init: false
+webui: "http://[HOST]:[PORT:5000]/"
+watchdog: "http://[HOST]:[PORT:5000]/"
+ingress: true
+ingress_port: 5000
+ingress_entry: /
+panel_admin: false
+homeassistant_api: true
+hassio_api: true
+ports:
+  8555/tcp: 8555
+  8555/udp: 8555
+  8554/tcp: null
+  8971/tcp: null
+  5000/tcp: null
+  1984/tcp: null
+  1935/tcp: null
+ports_description:
+  8555/tcp: WebRTC over tcp
+  8555/udp: WebRTC over udp
+  8554/tcp: RTSP Restream
+  8971/tcp: Authenticated web interface
+  5000/tcp: Unauthenticated web interface (not required for Home Assistant Ingress)
+  1984/tcp: go2rtc API
+host_network: false
+devices:
+  - /dev/dri/renderD128
+  - /dev/apex_0
+  - /dev/apex_1
+  - /dev/apex_2
+  - /dev/apex_3
+  - /dev/dri/card0
+  - /dev/vchiq
+  - /dev/video10
+  - /dev/video0
+  - /dev/hailo0
+  - /dev/hailo1
+usb: true
+video: true
+tmpfs: true
+full_access: false
+privileged:
+  - PERFMON
+schema:
+  plus_api_key: password?
+  go2rtc_allow_arbitrary_exec: str?
+services:
+  - "mqtt:want"
+arch:
+  - amd64
+map:
+  - "media:rw"
+  - "app_config:rw"
+  - "homeassistant_config:rw"
+  - "ssl"

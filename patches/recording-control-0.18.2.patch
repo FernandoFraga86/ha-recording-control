@@ -1,0 +1,3665 @@
+diff --git a/frigate/api/defs/request/app_body.py b/frigate/api/defs/request/app_body.py
+index a331482..6edc99e 100644
+--- a/frigate/api/defs/request/app_body.py
++++ b/frigate/api/defs/request/app_body.py
+@@ -1,4 +1,4 @@
+-from typing import Any
++from typing import Any, Literal
+ 
+ from pydantic import BaseModel, Field
+ 
+@@ -44,6 +44,13 @@ class CameraSetBody(BaseModel):
+     value: str = Field(..., description="The value to set for the feature")
+ 
+ 
++class RecordingControlBody(BaseModel):
++    camera: str = Field(..., min_length=1, max_length=128)
++    enabled: bool
++    operation_id: str = Field(..., min_length=1, max_length=128)
++    purpose: Literal["normal", "privacy", "protective_off", "restore"]
++
++
+ class MediaSyncBody(BaseModel):
+     dry_run: bool = Field(
+         default=True, description="If True, only report orphans without deleting them"
+diff --git a/frigate/api/record.py b/frigate/api/record.py
+index 5db257f..cea3ca8 100644
+--- a/frigate/api/record.py
++++ b/frigate/api/record.py
+@@ -23,6 +23,7 @@ from frigate.api.defs.query.recordings_query_parameters import (
+     MediaRecordingsSummaryQueryParams,
+     RecordingsDeleteQueryParams,
+ )
++from frigate.api.defs.request.app_body import RecordingControlBody
+ from frigate.api.defs.response.generic_response import GenericResponse
+ from frigate.api.defs.tags import Tags
+ from frigate.const import RECORD_DIR
+@@ -34,6 +35,68 @@ logger = logging.getLogger(__name__)
+ router = APIRouter(tags=[Tags.recordings])
+ 
+ 
++@router.get(
++    "/recordings/control/authority",
++    dependencies=[Depends(require_role(["admin"]))],
++)
++def get_recording_control_authority(request: Request):
++    """Return the live recording controller generation and startup fences."""
++    dispatcher = request.app.dispatcher
++    if dispatcher is None:
++        return JSONResponse(
++            content={"status": "hold", "reason": "dispatcher_unavailable"},
++            status_code=503,
++        )
++    result = dispatcher.recording_authority_status()
++    status_code = 200 if result.get("status") == "ready" else 503
++    return JSONResponse(content=result, status_code=status_code)
++
++
++@router.post(
++    "/recordings/control",
++    dependencies=[Depends(require_role(["admin"]))],
++)
++def begin_recording_control(request: Request, body: RecordingControlBody):
++    """Start a correlated recording transition and return its current status."""
++    dispatcher = request.app.dispatcher
++    if dispatcher is None:
++        return JSONResponse(
++            content={"status": "hold", "reason": "dispatcher_unavailable"},
++            status_code=503,
++        )
++    result = dispatcher.begin_recording_control(
++        body.camera,
++        body.enabled,
++        body.operation_id,
++        purpose=body.purpose,
++    )
++    if result.get("status") == "hold":
++        return JSONResponse(content=result, status_code=409)
++    status_code = 200 if result.get("status") == "applied" else 202
++    return JSONResponse(content=result, status_code=status_code)
++
++
++@router.get(
++    "/recordings/control/{operation_id}",
++    dependencies=[Depends(require_role(["admin"]))],
++)
++def get_recording_control_status(request: Request, operation_id: str):
++    """Return current worker evidence for a recording transition."""
++    dispatcher = request.app.dispatcher
++    if dispatcher is None:
++        return JSONResponse(
++            content={"status": "hold", "reason": "dispatcher_unavailable"},
++            status_code=503,
++        )
++    result = dispatcher.recording_control_status(operation_id)
++    if result is None:
++        return JSONResponse(
++            content={"status": "unknown_operation"},
++            status_code=404,
++        )
++    return JSONResponse(content=result)
++
++
+ @router.get("/recordings/storage", dependencies=[Depends(require_role(["admin"]))])
+ def get_recordings_storage_usage(request: Request):
+     recording_stats = request.app.stats_emitter.get_latest_stats()["service"][
+diff --git a/frigate/comms/dispatcher.py b/frigate/comms/dispatcher.py
+index ec16f97..0765e0c 100644
+--- a/frigate/comms/dispatcher.py
++++ b/frigate/comms/dispatcher.py
+@@ -3,12 +3,23 @@
+ import datetime
+ import json
+ import logging
++import math
++import threading
++import time
++import uuid
+ from collections.abc import Callable, Iterable
+ from typing import Any, cast
+ 
++import psutil
++
+ from frigate.camera import PTZMetrics
+ from frigate.camera.activity_manager import AudioActivityManager, CameraActivityManager
+ from frigate.comms.base_communicator import Communicator
++from frigate.comms.recording_control_protocol import (
++    RecordingOffBarrier,
++    validate_writer_exit_receipts,
++    writer_set_digest,
++)
+ from frigate.comms.runtime_state import RuntimeStatePersistence
+ from frigate.comms.webpush import WebPushClient
+ from frigate.config import BirdseyeModeEnum, FrigateConfig
+@@ -16,6 +27,8 @@ from frigate.config.camera.updater import (
+     CameraConfigUpdateEnum,
+     CameraConfigUpdatePublisher,
+     CameraConfigUpdateTopic,
++    RecordingControlUpdate,
++    RecordingDrainBarrier,
+ )
+ from frigate.config.config import RuntimeFilterConfig, RuntimeMotionConfig
+ from frigate.config.profile_manager import ProfileManager
+@@ -45,6 +58,9 @@ from frigate.util.services import restart_frigate
+ 
+ logger = logging.getLogger(__name__)
+ 
++RECORDING_CONTROL_WORKERS = {"camera_capture", "recording_maintainer"}
++RECORDING_CONTROL_TIMEOUT_SECONDS = 60.0
++
+ 
+ class Dispatcher:
+     """Handle communication between Frigate and communicators."""
+@@ -70,6 +86,51 @@ class Dispatcher:
+         self.birdseye_layout: dict[str, Any] = {}
+         self.audio_transcription_state: str = "idle"
+         self._runtime_state = RuntimeStatePersistence()
++        self._recording_control_lock = threading.RLock()
++        self._recording_control_generation = uuid.uuid4().hex
++        try:
++            process = psutil.Process()
++            self._recording_control_process_identity = {
++                "pid": process.pid,
++                "created": process.create_time(),
++            }
++        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
++            self._recording_control_process_identity = None
++        self._recording_control_requests: dict[str, dict[str, Any]] = {}
++        self._recording_control_by_camera: dict[str, str] = {}
++        self._recording_worker_registry: dict[str, dict[str, Any]] = {}
++        self._recording_generation_invalid_reason: str | None = None
++        self._recording_fences, fences_valid = (
++            self._runtime_state.load_recording_fences()
++        )
++        if not fences_valid:
++            logger.error(
++                "Recording admission state is unreadable; fencing all cameras"
++            )
++            self._recording_fences = set(self.config.cameras)
++        recording_control = getattr(self.config, "recording_control", None)
++        startup_fences = getattr(recording_control, "startup_fenced_cameras", [])
++        if not isinstance(startup_fences, list):
++            raise ValueError("recording startup fence configuration is malformed")
++        unknown_fences = set(startup_fences) - set(self.config.cameras)
++        if unknown_fences:
++            raise ValueError(
++                "recording startup fence references unknown cameras: "
++                f"{sorted(unknown_fences)}"
++            )
++        for camera_name in startup_fences:
++            if not self._runtime_state.set_recording_fence(camera_name, True):
++                logger.error(
++                    "Unable to persist startup recording fence; fencing all cameras"
++                )
++                self._recording_fences = set(self.config.cameras)
++                break
++            self._recording_fences.add(camera_name)
++        for camera_name in self._recording_fences:
++            camera = self.config.cameras.get(camera_name)
++            if camera is not None:
++                camera.record.enabled = False
++                camera.recreate_ffmpeg_cmds()
+         self._camera_settings_handlers: dict[str, Callable] = {
+             "audio": self._on_audio_command,
+             "audio_transcription": self._on_audio_transcription_command,
+@@ -351,6 +412,13 @@ class Dispatcher:
+             "audioTranscriptionState": handle_audio_transcription_state,
+             "birdseyeLayout": handle_birdseye_layout,
+             "onConnect": handle_on_connect,
++            "recording_control/ack": lambda: self._on_recording_control_ack(payload),
++            "recording_control/worker_ready": lambda: self._on_recording_worker_ready(
++                payload
++            ),
++            "recording_control/worker_invalidated": lambda: self._on_recording_worker_invalidated(
++                payload
++            ),
+         }
+ 
+         if topic.endswith("set") or topic.endswith("ptz") or topic.endswith("suspend"):
+@@ -526,6 +594,10 @@ class Dispatcher:
+                 elif topic == "snapshots":
+                     camera.snapshots.enabled = value
+                 elif topic == "recordings":
++                    if camera_name in self._recording_fences:
++                        camera.record.enabled = False
++                        camera.recreate_ffmpeg_cmds()
++                        continue
+                     if value and not camera.record.enabled_in_config:
+                         continue
+                     camera.record.enabled = value
+@@ -794,28 +866,783 @@ class Dispatcher:
+     def _on_recordings_command(self, camera_name: str, payload: str) -> None:
+         """Callback for recordings topic."""
+         record_settings = self.config.cameras[camera_name].record
++        if payload not in {"ON", "OFF"}:
++            logger.warning("Ignoring invalid recordings command for %s", camera_name)
++            return
+ 
+-        if payload == "ON":
+-            if not self.config.cameras[camera_name].record.enabled_in_config:
++        enabled = payload == "ON"
++        if enabled and not record_settings.enabled_in_config:
++            logger.error(
++                "Recordings must be enabled in the config to be turned on via MQTT."
++            )
++            return
++
++        already_fenced = camera_name in self._recording_fences
++        if enabled and already_fenced:
++            logger.warning("Rejecting ON for fenced recordings on %s", camera_name)
++            self.publish(f"{camera_name}/recordings/state", "OFF", retain=True)
++            return
++
++        purpose = "protective_off" if (not enabled and already_fenced) else "normal"
++        request_id = uuid.uuid4().hex
++        result = self.begin_recording_control(
++            camera_name,
++            enabled,
++            request_id,
++            purpose=purpose,
++        )
++        if result.get("status") != "pending":
++            logger.error(
++                "Unable to start recording transition for %s: %s",
++                camera_name,
++                result.get("reason", "unknown reason"),
++            )
++
++    @staticmethod
++    def _recording_worker_key(worker: str, camera: str | None = None) -> str:
++        return f"camera_capture:{camera}" if worker == "camera_capture" else worker
++
++    @staticmethod
++    def _identity_state(identity: Any) -> bool | None:
++        """Return True for the same live process, False for exited, None if unknown."""
++        if not isinstance(identity, dict):
++            return None
++        pid = identity.get("pid")
++        created = identity.get("created")
++        if (
++            isinstance(pid, bool)
++            or not isinstance(pid, int)
++            or pid <= 0
++            or isinstance(created, bool)
++            or not isinstance(created, (int, float))
++        ):
++            return None
++        try:
++            created = float(created)
++        except OverflowError:
++            return None
++        if not math.isfinite(created):
++            return None
++        try:
++            process = psutil.Process(pid)
++            if not process.is_running():
++                return False
++            return abs(process.create_time() - created) <= 0.05
++        except (psutil.NoSuchProcess, psutil.ZombieProcess):
++            return False
++        except psutil.AccessDenied:
++            return None
++        except (ValueError, OverflowError):
++            return None
++
++    def _expected_recording_worker_keys(self) -> set[str]:
++        return {
++            "recording_maintainer",
++            *(
++                self._recording_worker_key("camera_capture", camera)
++                for camera in self.config.cameras
++            ),
++        }
++
++    def _recording_workers_ready(self) -> tuple[bool, str | None]:
++        expected = self._expected_recording_worker_keys()
++        if set(self._recording_worker_registry) != expected:
++            return False, "worker_roster_incomplete"
++        for key in sorted(expected):
++            worker = self._recording_worker_registry[key]
++            writers = worker.get("record_processes")
++            if (
++                not isinstance(writers, list)
++                or writer_set_digest(writers) != worker.get("writer_set_digest")
++            ):
++                return False, "worker_inventory_digest_mismatch"
++            if worker.get("inventory_complete") is not True:
++                return False, "worker_inventory_incomplete"
++            if self._identity_state(worker.get("worker_identity")) is not True:
++                return False, "worker_identity_not_live"
++            if worker.get("configuration_consistent") is not True:
++                return False, "recording_inventory_conflicts_with_config"
++            for writer in writers:
++                if self._identity_state(writer) is not True:
++                    return False, "record_writer_identity_not_live"
++        return True, None
++
++    def _on_recording_worker_ready(self, payload: Any) -> dict[str, Any]:
++        """Register a live worker and its complete recording-writer inventory."""
++        if not isinstance(payload, dict):
++            return {"status": "hold", "reason": "invalid_worker_registration"}
++        worker = payload.get("worker")
++        camera = payload.get("camera")
++        if worker not in RECORDING_CONTROL_WORKERS:
++            return {"status": "hold", "reason": "unknown_worker"}
++        if worker == "camera_capture":
++            if not isinstance(camera, str) or camera not in self.config.cameras:
++                return {"status": "hold", "reason": "unknown_camera_worker"}
++        elif camera is not None:
++            return {"status": "hold", "reason": "unexpected_maintainer_camera"}
++
++        worker_instance = payload.get("worker_instance")
++        worker_identity = payload.get("worker_identity")
++        writers = payload.get("record_processes")
++        inventory_complete = payload.get("inventory_complete")
++        if (
++            not isinstance(worker_instance, str)
++            or not worker_instance
++            or not isinstance(worker_identity, dict)
++            or self._identity_state(worker_identity) is not True
++            or not isinstance(writers, list)
++            or inventory_complete is not True
++            or writer_set_digest(writers) != payload.get("writer_set_digest")
++            or any(self._identity_state(writer) is not True for writer in writers)
++        ):
++            return {"status": "hold", "reason": "worker_inventory_unverified"}
++
++        if worker == "camera_capture":
++            record_enabled = payload.get("record_enabled")
++            camera_enabled = payload.get("camera_enabled")
++            configured_count = payload.get("configured_record_output_count")
++            if (
++                not isinstance(record_enabled, bool)
++                or not isinstance(camera_enabled, bool)
++                or isinstance(configured_count, bool)
++                or not isinstance(configured_count, int)
++                or configured_count < 0
++            ):
++                return {"status": "hold", "reason": "invalid_camera_inventory"}
++            expected_count = (
++                configured_count if camera_enabled and record_enabled else 0
++            )
++            configuration_consistent = len(writers) == expected_count
++        else:
++            if writers:
++                return {"status": "hold", "reason": "maintainer_has_writer_inventory"}
++            record_enabled = False
++            camera_enabled = False
++            configured_count = 0
++            configuration_consistent = True
++
++        key = self._recording_worker_key(worker, camera)
++        entry = {
++            "worker": worker,
++            "camera": camera,
++            "worker_instance": worker_instance,
++            "worker_identity": dict(worker_identity),
++            "inventory_complete": True,
++            "record_processes": [dict(item) for item in writers],
++            "writer_set_digest": payload["writer_set_digest"],
++            "record_enabled": record_enabled,
++            "camera_enabled": camera_enabled,
++            "configured_record_output_count": configured_count,
++            "configuration_consistent": configuration_consistent,
++        }
++        with self._recording_control_lock:
++            previous = self._recording_worker_registry.get(key)
++            if previous is not None and any(
++                previous.get(field) != entry.get(field)
++                for field in (
++                    "worker_instance",
++                    "worker_identity",
++                    "record_processes",
++                    "writer_set_digest",
++                    "record_enabled",
++                    "camera_enabled",
++                    "configured_record_output_count",
++                )
++            ):
++                self._invalidate_recording_generation_locked(
++                    "worker_identity_or_inventory_changed", camera
++                )
++            self._recording_worker_registry[key] = entry
++            ready, reason = self._recording_workers_ready()
++            if ready:
++                self._recording_generation_invalid_reason = None
++            return {
++                "status": "ready" if ready else "registered",
++                "generation": self._recording_control_generation,
++                "reason": reason,
++            }
++
++    def _invalidate_recording_generation_locked(
++        self, reason: str, camera: str | None
++    ) -> None:
++        """Invalidate all old receipts and durably fence affected cameras."""
++        self._recording_control_generation = uuid.uuid4().hex
++        self._recording_generation_invalid_reason = reason
++        affected = [camera] if camera is not None else list(self.config.cameras)
++        for camera_name in affected:
++            if camera_name not in self.config.cameras:
++                continue
++            self._recording_fences.add(camera_name)
++            if not self._runtime_state.set_recording_fence(camera_name, True):
+                 logger.error(
+-                    "Recordings must be enabled in the config to be turned on via MQTT."
++                    "Unable to persist recording fence after authority invalidation for %s",
++                    camera_name,
+                 )
+-                return
++        for request in self._recording_control_requests.values():
++            if request.get("status") in {"pending", "applied"} and (
++                camera is None or request.get("camera") == camera
++            ):
++                off_barrier = request.get("off_barrier")
++                if off_barrier is not None:
++                    off_barrier.invalidate(reason)
++                request["status"] = "invalidated"
++                request["reason"] = "recording_generation_invalidated"
++        if camera is None:
++            self._recording_worker_registry.pop("recording_maintainer", None)
++        else:
++            self._recording_worker_registry.pop(
++                self._recording_worker_key("camera_capture", camera), None
++            )
+ 
+-            if not record_settings.enabled:
+-                logger.info(f"Turning on recordings for {camera_name}")
+-                record_settings.enabled = True
+-        elif payload == "OFF":
+-            if record_settings.enabled:
+-                logger.info(f"Turning off recordings for {camera_name}")
+-                record_settings.enabled = False
++    def _on_recording_worker_invalidated(self, payload: Any) -> dict[str, Any]:
++        """Invalidate authority after a worker restart or uncorrelated reconfigure."""
++        if not isinstance(payload, dict):
++            return {"status": "hold", "reason": "invalid_invalidation"}
++        worker = payload.get("worker")
++        camera = payload.get("camera")
++        worker_instance = payload.get("worker_instance")
++        if worker not in RECORDING_CONTROL_WORKERS or not isinstance(
++            worker_instance, str
++        ):
++            return {"status": "hold", "reason": "invalid_invalidation"}
++        key = self._recording_worker_key(worker, camera)
++        with self._recording_control_lock:
++            entry = self._recording_worker_registry.get(key)
++            if entry is None or entry.get("worker_instance") != worker_instance:
++                return {"status": "hold", "reason": "stale_worker_invalidation"}
++            self._invalidate_recording_generation_locked(
++                str(payload.get("reason") or "worker_state_changed"), camera
++            )
++            return {
++                "status": "hold",
++                "reason": self._recording_generation_invalid_reason,
++                "generation": self._recording_control_generation,
++            }
+ 
+-        self.config_updater.publish_update(
+-            CameraConfigUpdateTopic(CameraConfigUpdateEnum.record, camera_name),
+-            record_settings,
++    def begin_recording_control(
++        self,
++        camera_name: str,
++        enabled: bool,
++        operation_id: str,
++        *,
++        purpose: str,
++    ) -> dict[str, Any]:
++        """Fence and publish a correlated recording update for worker application."""
++        if (
++            not isinstance(operation_id, str)
++            or not operation_id
++            or len(operation_id) > 128
++            or any(ord(char) < 32 for char in operation_id)
++            or not isinstance(enabled, bool)
++        ):
++            return {"status": "hold", "reason": "invalid_request"}
++        if camera_name not in self.config.cameras:
++            return {"status": "hold", "reason": "unknown_camera"}
++        if purpose not in {"normal", "privacy", "protective_off", "restore"}:
++            return {"status": "hold", "reason": "invalid_purpose"}
++        if purpose in {"privacy", "protective_off"} and enabled:
++            return {"status": "hold", "reason": "protected_transition_must_be_off"}
++
++        with self._recording_control_lock:
++            existing = self._recording_control_requests.get(operation_id)
++            if existing is not None:
++                if (
++                    existing["camera"] == camera_name
++                    and existing["enabled"] == enabled
++                    and existing["purpose"] == purpose
++                ):
++                    return self._recording_control_status_locked(existing)
++                return {"status": "hold", "reason": "operation_id_reused"}
++
++            workers_ready, worker_reason = self._recording_workers_ready()
++            if not workers_ready:
++                return {
++                    "status": "hold",
++                    "reason": worker_reason or "recording_workers_unavailable",
++                }
++
++            was_fenced = camera_name in self._recording_fences
++            if purpose == "normal" and was_fenced:
++                return {"status": "hold", "reason": "recording_fenced"}
++            if purpose == "restore" and not was_fenced:
++                return {"status": "hold", "reason": "no_fenced_restore_pending"}
++
++            current_id = self._recording_control_by_camera.get(camera_name)
++            if current_id is not None:
++                current = self._recording_control_requests.get(current_id)
++                if current and current["status"] == "pending":
++                    if enabled:
++                        return {"status": "hold", "reason": "transition_pending"}
++                    current["status"] = "superseded"
++
++            if enabled and not self.config.cameras[camera_name].record.enabled_in_config:
++                return {"status": "hold", "reason": "recording_disabled_in_config"}
++
++            camera_worker = self._recording_worker_registry[
++                self._recording_worker_key("camera_capture", camera_name)
++            ]
++            maintainer = self._recording_worker_registry["recording_maintainer"]
++            expected_writers = [
++                dict(item) for item in camera_worker["record_processes"]
++            ]
++            expected_writer_digest = writer_set_digest(expected_writers)
++            if expected_writer_digest is None:
++                return {"status": "hold", "reason": "writer_inventory_invalid"}
++
++            fence_persisted = self._runtime_state.set_recording_fence(
++                camera_name, True
++            )
++            if not fence_persisted and enabled:
++                self._recording_fences.add(camera_name)
++                return {"status": "hold", "reason": "fence_persistence_failed"}
++            if not fence_persisted:
++                logger.error(
++                    "Recording OFF proceeding with in-memory fence for %s; "
++                    "durable state is unavailable",
++                    camera_name,
++                )
++            self._recording_fences.add(camera_name)
++
++            runtime_state_saved = self._runtime_state.set(
++                camera_name, "recordings", enabled
++            )
++            if not runtime_state_saved and enabled:
++                return {"status": "hold", "reason": "runtime_state_persistence_failed"}
++            if not runtime_state_saved:
++                logger.error(
++                    "Recording OFF proceeding under durable admission fence for %s",
++                    camera_name,
++                )
++
++            camera_config = self.config.cameras[camera_name]
++            record_settings = camera_config.record
++            record_settings.enabled = enabled
++            camera_config.recreate_ffmpeg_cmds()
++            keep_fenced = purpose in {"privacy", "protective_off"}
++            if purpose == "restore":
++                keep_fenced = False
++            request = {
++                "request_id": operation_id,
++                "camera": camera_name,
++                "enabled": enabled,
++                "purpose": purpose,
++                "keep_fenced": keep_fenced,
++                "status": "pending",
++                "phase": "config_pending",
++                "acks": {},
++                "generation": self._recording_control_generation,
++                "fence_persisted": fence_persisted,
++                "started_monotonic": time.monotonic(),
++                "expected_writers": expected_writers,
++                "writer_set_digest": expected_writer_digest,
++                "off_barrier": (
++                    None
++                    if enabled
++                    else RecordingOffBarrier(
++                        operation_id,
++                        self._recording_control_generation,
++                        camera_name,
++                        expected_writers,
++                        expected_writer_digest,
++                    )
++                ),
++                "worker_instances": {
++                    "camera_capture": camera_worker["worker_instance"],
++                    "recording_maintainer": maintainer["worker_instance"],
++                },
++            }
++            self._recording_control_requests[operation_id] = request
++            self._recording_control_by_camera[camera_name] = operation_id
++            try:
++                self.config_updater.publish_update(
++                    CameraConfigUpdateTopic(CameraConfigUpdateEnum.record, camera_name),
++                    RecordingControlUpdate(
++                        operation_id,
++                        request["generation"],
++                        record_settings.model_copy(deep=True),
++                        expected_writers,
++                        expected_writer_digest,
++                    ),
++                )
++            except Exception:
++                logger.exception("Failed to publish recording control update")
++                request["status"] = "hold"
++                return self._recording_control_status_locked(request)
++
++            return self._recording_control_status_locked(request)
++
++    def recording_control_status(self, operation_id: str) -> dict[str, Any] | None:
++        """Return current correlated worker evidence, invalidating stale receipts."""
++        with self._recording_control_lock:
++            request = self._recording_control_requests.get(operation_id)
++            if request is None:
++                return None
++            if (
++                request["status"] == "pending"
++                and time.monotonic() - request["started_monotonic"]
++                > RECORDING_CONTROL_TIMEOUT_SECONDS
++            ):
++                request["status"] = "hold"
++                request["reason"] = "worker_ack_timeout"
++                if request["enabled"]:
++                    self._reassert_recording_off_locked(request)
++            if request["status"] == "applied" and not self._recording_receipts_current(
++                request
++            ):
++                request["status"] = "invalidated"
++                request["reason"] = "worker_receipt_or_generation_stale"
++                if request["enabled"]:
++                    self._reassert_recording_off_locked(request)
++            result = self._recording_control_status_locked(request)
++            if "reassert_operation_id" in request:
++                result["reassert_operation_id"] = request["reassert_operation_id"]
++                result["reassert_status"] = request["reassert_status"]
++            return result
++
++    def recording_authority_status(self) -> dict[str, Any]:
++        """Expose a live dispatcher identity and complete current worker roster."""
++        with self._recording_control_lock:
++            try:
++                process = psutil.Process()
++                current_identity = {
++                    "pid": process.pid,
++                    "created": process.create_time(),
++                }
++            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
++                current_identity = None
++            if (
++                not isinstance(self._recording_control_process_identity, dict)
++                or current_identity != self._recording_control_process_identity
++            ):
++                return {"status": "hold", "reason": "dispatcher_identity_unavailable"}
++            workers_ready, reason = self._recording_workers_ready()
++            if not workers_ready:
++                return {
++                    "status": "hold",
++                    "reason": reason or self._recording_generation_invalid_reason,
++                    "generation": self._recording_control_generation,
++                    "registered_workers": sorted(self._recording_worker_registry),
++                    "expected_workers": sorted(
++                        self._expected_recording_worker_keys()
++                    ),
++                }
++            return {
++                "status": "ready",
++                "generation": self._recording_control_generation,
++                "dispatcher_identity": dict(self._recording_control_process_identity),
++                "workers": {
++                    key: {
++                        "worker_instance": entry["worker_instance"],
++                        "worker_identity": dict(entry["worker_identity"]),
++                        "writer_set_digest": entry["writer_set_digest"],
++                        "record_processes": [
++                            dict(item) for item in entry["record_processes"]
++                        ],
++                    }
++                    for key, entry in sorted(
++                        self._recording_worker_registry.items()
++                    )
++                },
++                "fenced_cameras": sorted(self._recording_fences),
++            }
++
++    def _reassert_recording_off_locked(self, request: dict[str, Any]) -> None:
++        """Keep the fence and issue one protective OFF after failed ON evidence."""
++        camera = request["camera"]
++        self._recording_fences.add(camera)
++        self._runtime_state.set_recording_fence(camera, True)
++        self._runtime_state.set(camera, "recordings", False)
++        reassert_id = f"reassert-{uuid.uuid4().hex}"
++        reassert = self.begin_recording_control(
++            camera,
++            False,
++            reassert_id,
++            purpose="protective_off",
++        )
++        request["reassert_operation_id"] = reassert_id
++        request["reassert_status"] = reassert.get("status", "hold")
++
++    def _recording_control_status_locked(
++        self, request: dict[str, Any]
++    ) -> dict[str, Any]:
++        return {
++            "status": request["status"],
++            "phase": request.get("phase"),
++            "reason": request.get("reason"),
++            "operation_id": request["request_id"],
++            "camera": request["camera"],
++            "enabled": request["enabled"],
++            "purpose": request["purpose"],
++            "generation": request["generation"],
++            "writer_set_digest": request["writer_set_digest"],
++            "barrier_id": request.get("barrier_id"),
++            "writer_exit_receipts": request.get("writer_exit_receipts"),
++            "acks": sorted(request["acks"]),
++            "worker_receipts": {
++                worker: {
++                    key: value
++                    for key, value in ack.items()
++                    if key != "worker_instance"
++                }
++                | {"worker_instance": ack["worker_instance"]}
++                for worker, ack in request["acks"].items()
++            },
++            "fenced": request["camera"] in self._recording_fences,
++        }
++
++    def _recording_acks_alive(self, request: dict[str, Any]) -> bool:
++        if set(request["acks"]) != RECORDING_CONTROL_WORKERS:
++            return False
++        return all(
++            self._worker_ack_alive(ack)
++            for ack in request["acks"].values()
+         )
+-        self._runtime_state.set(camera_name, "recordings", record_settings.enabled)
+-        self.publish(f"{camera_name}/recordings/state", payload, retain=True)
++
++    def _request_workers_current(self, request: dict[str, Any]) -> bool:
++        camera_key = self._recording_worker_key(
++            "camera_capture", request["camera"]
++        )
++        camera_worker = self._recording_worker_registry.get(camera_key)
++        maintainer = self._recording_worker_registry.get("recording_maintainer")
++        return bool(
++            camera_worker
++            and maintainer
++            and camera_worker.get("worker_instance")
++            == request["worker_instances"].get("camera_capture")
++            and maintainer.get("worker_instance")
++            == request["worker_instances"].get("recording_maintainer")
++            and request["generation"] == self._recording_control_generation
++        )
++
++    def _recording_receipts_current(self, request: dict[str, Any]) -> bool:
++        if not self._request_workers_current(request) or not self._recording_acks_alive(
++            request
++        ):
++            return False
++        if not request["enabled"]:
++            exits = request.get("writer_exit_receipts")
++            if not validate_writer_exit_receipts(
++                request["expected_writers"],
++                request["writer_set_digest"],
++                exits,
++                inventory_complete=request.get("writer_inventory_complete"),
++            ):
++                return False
++            return all(
++                self._identity_state(receipt) is False for receipt in exits
++            )
++        return True
++
++    def _worker_ack_alive(self, ack: dict[str, Any]) -> bool:
++        record_processes = ack.get("record_processes", [])
++        if not isinstance(record_processes, list):
++            return False
++        identities = [ack.get("worker_identity"), *record_processes]
++        if not identities or any(not isinstance(item, dict) for item in identities):
++            return False
++        for identity in identities:
++            if self._identity_state(identity) is not True:
++                return False
++        return True
++
++    def _on_recording_control_ack(self, payload: Any) -> dict[str, Any] | None:
++        """Apply ordered writer-stop, maintainer-drain, or enabled receipts."""
++        if not isinstance(payload, dict):
++            return None
++        operation_id = payload.get("operation_id")
++        worker = payload.get("worker")
++        with self._recording_control_lock:
++            request = self._recording_control_requests.get(operation_id)
++            if (
++                request is not None
++                and request["status"] == "pending"
++                and time.monotonic() - request["started_monotonic"]
++                > RECORDING_CONTROL_TIMEOUT_SECONDS
++            ):
++                request["status"] = "hold"
++                request["reason"] = "worker_ack_timeout"
++                if request["enabled"]:
++                    self._reassert_recording_off_locked(request)
++                return self._recording_control_status_locked(request)
++            if (
++                request is None
++                or request["status"] != "pending"
++                or worker not in RECORDING_CONTROL_WORKERS
++                or request["camera"] != payload.get("camera")
++                or request["enabled"] is not payload.get("enabled")
++                or payload.get("applied") is not True
++                or payload.get("generation") != request["generation"]
++                or request["generation"] != self._recording_control_generation
++                or payload.get("worker_instance")
++                != request["worker_instances"].get(worker)
++            ):
++                return None
++            worker_identity = payload.get("worker_identity")
++            registry_key = self._recording_worker_key(worker, request["camera"])
++            registry_entry = self._recording_worker_registry.get(registry_key)
++            if (
++                registry_entry is None
++                or registry_entry.get("worker_identity") != worker_identity
++                or self._identity_state(worker_identity) is not True
++            ):
++                request["status"] = "hold"
++                request["reason"] = "worker_identity_changed"
++                return self._recording_control_status_locked(request)
++
++            if not request["enabled"] and worker == "camera_capture":
++                exits = payload.get("writer_exit_receipts")
++                processes_exited = isinstance(exits, list) and all(
++                    self._identity_state(item) is False for item in exits
++                )
++                off_barrier = request.get("off_barrier")
++                if off_barrier is None or not off_barrier.accept_writers_stopped(
++                    payload,
++                    expected_worker_instance=request["worker_instances"][
++                        "camera_capture"
++                    ],
++                    processes_exited=processes_exited,
++                ):
++                    request["status"] = "hold"
++                    request["reason"] = "writer_exit_inventory_unproven"
++                    return self._recording_control_status_locked(request)
++
++                request["writer_exit_receipts"] = off_barrier.writer_exit_receipts
++                request["writer_inventory_complete"] = True
++                request["phase"] = off_barrier.phase
++                request["acks"]["camera_capture"] = {
++                    "worker_instance": payload["worker_instance"],
++                    "worker_identity": dict(worker_identity),
++                    "record_processes": [],
++                    "recording_segment": None,
++                }
++                registry_entry["record_processes"] = []
++                registry_entry["writer_set_digest"] = writer_set_digest([])
++                registry_entry["record_enabled"] = False
++                registry_entry["configured_record_output_count"] = 0
++                registry_entry["configuration_consistent"] = True
++                barrier_id = off_barrier.barrier_id
++                request["barrier_id"] = barrier_id
++                request["phase"] = "drain_pending"
++                try:
++                    self.config_updater.publish_update(
++                        CameraConfigUpdateTopic(
++                            CameraConfigUpdateEnum.record, request["camera"]
++                        ),
++                        RecordingDrainBarrier(
++                            operation_id,
++                            request["generation"],
++                            request["camera"],
++                            barrier_id,
++                            request["writer_set_digest"],
++                            request["worker_instances"]["recording_maintainer"],
++                        ),
++                    )
++                except Exception:
++                    logger.exception("Failed to publish recording drain barrier")
++                    request["status"] = "hold"
++                    request["reason"] = "drain_barrier_publish_failed"
++                return self._recording_control_status_locked(request)
++
++            if not request["enabled"] and worker == "recording_maintainer":
++                off_barrier = request.get("off_barrier")
++                if (
++                    request.get("phase") != "drain_pending"
++                    or off_barrier is None
++                    or not off_barrier.accept_drain_complete(
++                        payload,
++                        expected_worker_instance=request["worker_instances"][
++                            "recording_maintainer"
++                        ],
++                    )
++                ):
++                    return None
++                request["acks"]["recording_maintainer"] = {
++                    "worker_instance": payload["worker_instance"],
++                    "worker_identity": dict(worker_identity),
++                    "record_processes": [],
++                    "recording_segment": None,
++                }
++                request["phase"] = off_barrier.phase
++            elif request["enabled"]:
++                if payload.get("phase") != "enabled":
++                    return None
++                if worker == "camera_capture":
++                    record_processes = payload.get("record_processes")
++                    configured_count = payload.get("configured_record_output_count")
++                    recording_segment = payload.get("recording_segment")
++                    if (
++                        not isinstance(record_processes, list)
++                        or not record_processes
++                        or isinstance(configured_count, bool)
++                        or not isinstance(configured_count, int)
++                        or len(record_processes) != configured_count
++                        or payload.get("inventory_complete") is not True
++                        or writer_set_digest(record_processes)
++                        != payload.get("writer_set_digest")
++                        or any(self._identity_state(item) is not True for item in record_processes)
++                        or not isinstance(recording_segment, dict)
++                        or recording_segment.get("camera") != request["camera"]
++                        or not isinstance(recording_segment.get("start_time"), (int, float))
++                        or not isinstance(recording_segment.get("requested_at"), (int, float))
++                        or recording_segment["start_time"] < recording_segment["requested_at"]
++                    ):
++                        return None
++                    registry_entry["record_processes"] = [
++                        dict(item) for item in record_processes
++                    ]
++                    registry_entry["writer_set_digest"] = payload["writer_set_digest"]
++                    registry_entry["record_enabled"] = True
++                    registry_entry["configured_record_output_count"] = configured_count
++                    registry_entry["configuration_consistent"] = True
++                elif (
++                    payload.get("cache_sweep_complete") is not True
++                    or payload.get("inflight_tasks") != 0
++                    or not isinstance(payload.get("maintenance_sequence"), int)
++                    or payload.get("maintenance_sequence", 0) <= 0
++                ):
++                    return None
++                request["acks"][worker] = {
++                    "worker_instance": payload["worker_instance"],
++                    "worker_identity": dict(worker_identity),
++                    "record_processes": payload.get("record_processes", []),
++                    "recording_segment": payload.get("recording_segment"),
++                }
++                request["phase"] = "workers_acknowledging"
++            else:
++                return None
++
++            if set(request["acks"]) == RECORDING_CONTROL_WORKERS:
++                if not self._recording_receipts_current(request):
++                    request["status"] = "hold"
++                    request["reason"] = "worker_receipts_not_current"
++                    if request["enabled"]:
++                        self._reassert_recording_off_locked(request)
++                elif not request["fence_persisted"]:
++                    request["status"] = "hold"
++                    request["reason"] = "fence_persistence_failed"
++                elif request["keep_fenced"]:
++                    request["status"] = "applied"
++                    request["phase"] = "complete"
++                elif self._runtime_state.set_recording_fence(
++                    request["camera"], False
++                ):
++                    self._recording_fences.discard(request["camera"])
++                    request["status"] = "applied"
++                    request["phase"] = "complete"
++                else:
++                    request["status"] = "hold"
++                    request["reason"] = "fence_release_persistence_failed"
++                    if request["enabled"]:
++                        self._reassert_recording_off_locked(request)
++
++                if request["status"] == "applied":
++                    self.publish(
++                        f"{request['camera']}/recordings/state",
++                        "ON" if request["enabled"] else "OFF",
++                        retain=True,
++                    )
++
++            return self._recording_control_status_locked(request)
+ 
+     def _on_snapshots_command(self, camera_name: str, payload: str) -> None:
+         """Callback for snapshots topic."""
+diff --git a/frigate/comms/recording_control_protocol.py b/frigate/comms/recording_control_protocol.py
+new file mode 100644
+index 0000000..21a8b42
+--- /dev/null
++++ b/frigate/comms/recording_control_protocol.py
+@@ -0,0 +1,189 @@
++"""Validation helpers for correlated recording-writer stop barriers."""
++
++import hashlib
++import json
++import math
++import uuid
++from collections.abc import Mapping, Sequence
++from typing import Any
++
++
++def normalize_writer_identity(value: Any) -> dict[str, Any] | None:
++    """Return a canonical FFmpeg writer identity, or None if it is malformed."""
++    if not isinstance(value, Mapping):
++        return None
++    pid = value.get("pid")
++    created = value.get("created")
++    roles = value.get("roles")
++    if (
++        isinstance(pid, bool)
++        or not isinstance(pid, int)
++        or pid <= 0
++        or isinstance(created, bool)
++        or not isinstance(created, (int, float))
++        or not math.isfinite(created)
++        or not isinstance(roles, Sequence)
++        or isinstance(roles, (str, bytes))
++        or not roles
++        or any(not isinstance(role, str) or not role for role in roles)
++        or "record" not in roles
++        or len(set(roles)) != len(roles)
++    ):
++        return None
++    return {
++        "pid": pid,
++        "created": float(created),
++        "roles": sorted(roles),
++    }
++
++
++def writer_set_digest(values: Sequence[Any]) -> str | None:
++    """Hash a complete, duplicate-free set of writer process identities."""
++    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
++        return None
++    normalized: list[dict[str, Any]] = []
++    for value in values:
++        identity = normalize_writer_identity(value)
++        if identity is None:
++            return None
++        normalized.append(identity)
++    normalized.sort(key=lambda item: (item["pid"], item["created"], item["roles"]))
++    keys = [(item["pid"], item["created"], tuple(item["roles"])) for item in normalized]
++    if len(keys) != len(set(keys)):
++        return None
++    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
++    return hashlib.sha256(encoded).hexdigest()
++
++
++def validate_writer_exit_receipts(
++    expected_writers: Sequence[Any],
++    expected_digest: str,
++    receipts: Any,
++    *,
++    inventory_complete: Any,
++) -> bool:
++    """Require a one-to-one, observed exit receipt for every expected writer."""
++    if inventory_complete is not True or not isinstance(receipts, list):
++        return False
++    if writer_set_digest(expected_writers) != expected_digest:
++        return False
++    if writer_set_digest(receipts) != expected_digest:
++        return False
++    return all(
++        isinstance(receipt, Mapping)
++        and receipt.get("exit_observed") is True
++        and isinstance(receipt.get("exit_code"), int)
++        and not isinstance(receipt.get("exit_code"), bool)
++        for receipt in receipts
++    )
++
++
++def validate_drain_receipt(
++    receipt: Any,
++    *,
++    operation_id: str,
++    generation: str,
++    camera: str,
++    barrier_id: str,
++    writer_digest: str,
++    worker_instance: str,
++) -> bool:
++    """Validate that the maintainer completed the matching post-stop barrier."""
++    return (
++        isinstance(receipt, Mapping)
++        and receipt.get("phase") == "drain_complete"
++        and receipt.get("operation_id") == operation_id
++        and receipt.get("generation") == generation
++        and receipt.get("camera") == camera
++        and receipt.get("barrier_id") == barrier_id
++        and receipt.get("writer_set_digest") == writer_digest
++        and receipt.get("worker_instance") == worker_instance
++        and receipt.get("cache_clear") is True
++        and receipt.get("inflight_tasks") == 0
++        and isinstance(receipt.get("maintenance_sequence"), int)
++        and not isinstance(receipt.get("maintenance_sequence"), bool)
++        and receipt.get("maintenance_sequence", 0) > 0
++    )
++
++
++class RecordingOffBarrier:
++    """Enforce config -> writer exits -> post-exit drain ordering for one OFF."""
++
++    def __init__(
++        self,
++        operation_id: str,
++        generation: str,
++        camera: str,
++        expected_writers: Sequence[Any],
++        expected_digest: str,
++    ) -> None:
++        if writer_set_digest(expected_writers) != expected_digest:
++            raise ValueError("expected writer inventory is invalid")
++        self.operation_id = operation_id
++        self.generation = generation
++        self.camera = camera
++        self.expected_writers = [dict(item) for item in expected_writers]
++        self.expected_digest = expected_digest
++        self.phase = "config_pending"
++        self.barrier_id: str | None = None
++        self.writer_exit_receipts: list[dict[str, Any]] | None = None
++        self.reason: str | None = None
++
++    def accept_writers_stopped(
++        self, receipt: Any, *, expected_worker_instance: str, processes_exited: bool
++    ) -> bool:
++        """Accept only an exact, complete exit inventory for this operation."""
++        if self.phase != "config_pending":
++            return False
++        if (
++            not isinstance(receipt, Mapping)
++            or receipt.get("phase") != "writers_stopped"
++            or receipt.get("operation_id") != self.operation_id
++            or receipt.get("generation") != self.generation
++            or receipt.get("camera") != self.camera
++            or receipt.get("worker") != "camera_capture"
++            or receipt.get("worker_instance") != expected_worker_instance
++            or receipt.get("enabled") is not False
++            or receipt.get("applied") is not True
++            or receipt.get("inventory_complete") is not True
++            or receipt.get("writer_set_digest") != self.expected_digest
++            or receipt.get("record_processes") not in (None, [])
++            or processes_exited is not True
++        ):
++            return False
++        exits = receipt.get("writer_exit_receipts")
++        if not validate_writer_exit_receipts(
++            self.expected_writers,
++            self.expected_digest,
++            exits,
++            inventory_complete=True,
++        ):
++            return False
++        self.writer_exit_receipts = [dict(item) for item in exits]
++        self.barrier_id = uuid.uuid4().hex
++        self.phase = "writers_stopped"
++        return True
++
++    def accept_drain_complete(
++        self, receipt: Any, *, expected_worker_instance: str
++    ) -> bool:
++        """Accept the maintainer receipt only after the writer-stop phase."""
++        if self.phase != "writers_stopped" or self.barrier_id is None:
++            return False
++        if not validate_drain_receipt(
++            receipt,
++            operation_id=self.operation_id,
++            generation=self.generation,
++            camera=self.camera,
++            barrier_id=self.barrier_id,
++            writer_digest=self.expected_digest,
++            worker_instance=expected_worker_instance,
++        ):
++            return False
++        self.phase = "drain_complete"
++        return True
++
++    def invalidate(self, reason: str) -> None:
++        """Make this operation permanently ineligible for a positive receipt."""
++        self.phase = "hold_unreconciled"
++        self.reason = reason
+diff --git a/frigate/comms/runtime_state.py b/frigate/comms/runtime_state.py
+index be1b850..8ca56c1 100644
+--- a/frigate/comms/runtime_state.py
++++ b/frigate/comms/runtime_state.py
+@@ -57,13 +57,68 @@ class RuntimeStatePersistence:
+             if isinstance(features, dict)
+         }
+ 
+-    def set(self, camera: str, topic: str, value: bool) -> None:
++    def load_recording_fences(self) -> tuple[set[str], bool]:
++        """Load durable recording admission fences and report file validity.
++
++        A missing file is a valid empty state. A corrupt file or lock failure is
++        not treated as proof that no fence exists.
++        """
++        if not os.path.isdir(os.path.dirname(self._path)):
++            return set(), True
++        try:
++            with FileLock(self._lock_path, timeout=self._lock_timeout):
++                if not os.path.exists(self._path):
++                    return set(), True
++                with open(self._path) as state_file:
++                    data = json.load(state_file)
++        except (OSError, json.JSONDecodeError, Timeout):
++            logger.exception("Unable to load durable recording admission fences")
++            return set(), False
++
++        if not isinstance(data, dict):
++            return set(), False
++        fences = data.get("recording_fences", [])
++        if not isinstance(fences, list) or any(
++            not isinstance(camera, str) or not camera for camera in fences
++        ):
++            return set(), False
++        return set(fences), True
++
++    def set_recording_fence(self, camera: str, fenced: bool) -> bool:
++        """Persist one camera's ON admission fence before reporting success."""
++        if not camera:
++            return False
++        try:
++            with FileLock(self._lock_path, timeout=self._lock_timeout):
++                data = self._read_existing_locked()
++                if data is None:
++                    return False
++                cameras = data.setdefault("recording_fences", [])
++                if not isinstance(cameras, list) or any(
++                    not isinstance(name, str) or not name for name in cameras
++                ):
++                    return False
++                existing = set(cameras)
++                if fenced:
++                    existing.add(camera)
++                else:
++                    existing.discard(camera)
++                data["recording_fences"] = sorted(existing)
++                self._write_locked(data)
++        except (OSError, json.JSONDecodeError, Timeout):
++            logger.exception("Unable to persist recording admission fence")
++            return False
++        return True
++
++    def set(self, camera: str, topic: str, value: bool) -> bool:
+         """Persist a single (camera, topic, value). No-op if topic untracked."""
+         if topic not in self.TRACKED_TOPICS:
+-            return
++            return True
+         try:
+             with FileLock(self._lock_path, timeout=self._lock_timeout):
+-                data = self._read_locked()
++                data = self._read_existing_locked()
++                if data is None:
++                    return False
+                 cameras = data.setdefault("cameras", {})
+                 if not isinstance(cameras, dict):
+                     cameras = {}
+@@ -76,8 +131,11 @@ class RuntimeStatePersistence:
+                 self._write_locked(data)
+         except Timeout:
+             logger.error("Timed out persisting runtime state for %s/%s", camera, topic)
++            return False
+         except OSError:
+             logger.exception("Failed to persist runtime state for %s/%s", camera, topic)
++            return False
++        return True
+ 
+     def clear_all(self) -> None:
+         """Wipe every stored runtime override.
+@@ -90,7 +148,11 @@ class RuntimeStatePersistence:
+             with FileLock(self._lock_path, timeout=self._lock_timeout):
+                 if not os.path.exists(self._path):
+                     return
+-                self._write_locked({"cameras": {}})
++                data = self._read_existing_locked()
++                if data is None:
++                    return
++                data["cameras"] = {}
++                self._write_locked(data)
+         except Timeout:
+             logger.error("Timed out clearing runtime state")
+         except OSError:
+@@ -104,7 +166,9 @@ class RuntimeStatePersistence:
+         """
+         try:
+             with FileLock(self._lock_path, timeout=self._lock_timeout):
+-                data = self._read_locked()
++                data = self._read_existing_locked()
++                if data is None:
++                    return
+                 cameras = data.get("cameras")
+                 if not isinstance(cameras, dict) or camera not in cameras:
+                     return
+@@ -137,7 +201,9 @@ class RuntimeStatePersistence:
+ 
+         try:
+             with FileLock(self._lock_path, timeout=self._lock_timeout):
+-                data = self._read_locked()
++                data = self._read_existing_locked()
++                if data is None:
++                    return
+                 cameras = data.get("cameras")
+                 if not isinstance(cameras, dict):
+                     return
+@@ -174,9 +240,26 @@ class RuntimeStatePersistence:
+             return {}
+         return data if isinstance(data, dict) else {}
+ 
++    def _read_existing_locked(self) -> dict[str, Any] | None:
++        """Read valid persisted state without converting corruption to empty."""
++        if not os.path.exists(self._path):
++            return {}
++        try:
++            with open(self._path) as state_file:
++                data = json.load(state_file)
++        except (OSError, json.JSONDecodeError):
++            logger.exception("Refusing to overwrite invalid runtime state")
++            return None
++        if not isinstance(data, dict):
++            logger.error("Refusing to overwrite runtime state with invalid root type")
++            return None
++        return data
++
+     def _write_locked(self, data: dict[str, Any]) -> None:
+         """Atomically write the JSON file while the FileLock is held."""
+         tmp_path = f"{self._path}.tmp"
+         with open(tmp_path, "w") as f:
+             json.dump(data, f, indent=2, sort_keys=True)
++            f.flush()
++            os.fsync(f.fileno())
+         os.replace(tmp_path, self._path)
+diff --git a/frigate/config/camera/updater.py b/frigate/config/camera/updater.py
+index c0b9260..a9f5577 100644
+--- a/frigate/config/camera/updater.py
++++ b/frigate/config/camera/updater.py
+@@ -50,6 +50,29 @@ class CameraConfigUpdateTopic:
+         return f"config/cameras/{self.camera}/{self.update_type.name}"
+ 
+ 
++@dataclass
++class RecordingControlUpdate:
++    """Correlate a recording configuration update with worker acknowledgments."""
++
++    request_id: str
++    generation: str
++    settings: Any
++    expected_writers: list[dict[str, Any]]
++    writer_set_digest: str
++
++
++@dataclass
++class RecordingDrainBarrier:
++    """Request a post-writer-stop cache drain for one recording operation."""
++
++    request_id: str
++    generation: str
++    camera: str
++    barrier_id: str
++    writer_set_digest: str
++    maintainer_instance: str
++
++
+ class CameraConfigUpdatePublisher:
+     def __init__(self):
+         self.publisher = ConfigPublisher()
+@@ -71,6 +94,11 @@ class CameraConfigUpdateSubscriber:
+         self.config = config
+         self.camera_configs = camera_configs
+         self.topics = topics
++        self.recording_control_updates: list[
++            tuple[str, str, str, bool, list[dict[str, Any]], str]
++        ] = []
++        self.recording_drain_barriers: list[RecordingDrainBarrier] = []
++        self.recording_control_invalidations: list[tuple[str, str]] = []
+ 
+         base_topic = "config/cameras"
+ 
+@@ -129,8 +157,12 @@ class CameraConfigUpdateSubscriber:
+             config.objects = updated_config
+         elif update_type == CameraConfigUpdateEnum.record:
+             old_enabled_in_config = config.record.enabled_in_config
++            old_enabled = config.record.enabled
+             config.record = updated_config
+-            if old_enabled_in_config != updated_config.enabled_in_config:
++            if (
++                old_enabled_in_config != updated_config.enabled_in_config
++                or old_enabled != updated_config.enabled
++            ):
+                 config.recreate_ffmpeg_cmds()
+         elif update_type == CameraConfigUpdateEnum.review:
+             config.review = updated_config
+@@ -166,6 +198,43 @@ class CameraConfigUpdateSubscriber:
+             _, _, camera, raw_type = update_topic.split("/")
+             update_type = CameraConfigUpdateEnum[raw_type]
+ 
++            if update_type == CameraConfigUpdateEnum.record and isinstance(
++                update_config, RecordingControlUpdate
++            ):
++                settings = update_config.settings
++                self.recording_control_updates.append(
++                    (
++                        camera,
++                        update_config.request_id,
++                        update_config.generation,
++                        bool(settings.enabled),
++                        update_config.expected_writers,
++                        update_config.writer_set_digest,
++                    )
++                )
++                update_config = settings
++            elif update_type == CameraConfigUpdateEnum.record and isinstance(
++                update_config, RecordingDrainBarrier
++            ):
++                # Only the global recording maintainer subscribes to camera adds.
++                if CameraConfigUpdateEnum.add in self.topics:
++                    self.recording_drain_barriers.append(update_config)
++                continue
++            elif (
++                CameraConfigUpdateEnum.record in self.topics
++                and CameraConfigUpdateEnum.add not in self.topics
++                and update_type
++                in {
++                    CameraConfigUpdateEnum.record,
++                    CameraConfigUpdateEnum.ffmpeg,
++                    CameraConfigUpdateEnum.enabled,
++                    CameraConfigUpdateEnum.refresh,
++                }
++            ):
++                self.recording_control_invalidations.append(
++                    (camera, update_type.value)
++                )
++
+             if update_type in self.topics:
+                 if update_type.name in updated_topics:
+                     updated_topics[update_type.name].append(camera)
+@@ -176,5 +245,25 @@ class CameraConfigUpdateSubscriber:
+ 
+         return updated_topics
+ 
++    def drain_recording_control_updates(
++        self,
++    ) -> list[tuple[str, str, str, bool, list[dict[str, Any]], str]]:
++        """Return and clear correlated recording updates received by this worker."""
++        updates = self.recording_control_updates
++        self.recording_control_updates = []
++        return updates
++
++    def drain_recording_drain_barriers(self) -> list[RecordingDrainBarrier]:
++        """Return and clear post-writer cache drain barriers."""
++        barriers = self.recording_drain_barriers
++        self.recording_drain_barriers = []
++        return barriers
++
++    def drain_recording_control_invalidations(self) -> list[tuple[str, str]]:
++        """Return uncorrelated changes that can alter recording writers."""
++        invalidations = self.recording_control_invalidations
++        self.recording_control_invalidations = []
++        return invalidations
++
+     def stop(self) -> None:
+         self.subscriber.stop()
+diff --git a/frigate/config/config.py b/frigate/config/config.py
+index 470ce15..b8dfdcf 100644
+--- a/frigate/config/config.py
++++ b/frigate/config/config.py
+@@ -421,6 +421,20 @@ def verify_lpr_and_face(
+         )
+ 
+ 
++class RecordingControlConfig(FrigateBaseModel):
++    """Startup admission fences for explicitly managed recording cameras."""
++
++    startup_fenced_cameras: list[str] = Field(
++        default_factory=list,
++        title="Startup-fenced cameras",
++        description=(
++            "Cameras whose recording ON admission is durably fenced before MQTT "
++            "subscriptions start. Their workers remain off until an authorized "
++            "recording-control request completes."
++        ),
++    )
++
++
+ class FrigateConfig(FrigateBaseModel):
+     version: str | None = Field(
+         default=None,
+@@ -497,6 +511,12 @@ class FrigateConfig(FrigateBaseModel):
+         description="User interface preferences such as timezone, time/date formatting, and units.",
+     )
+ 
++    recording_control: RecordingControlConfig = Field(
++        default_factory=RecordingControlConfig,
++        title="Recording control",
++        description="Fail-safe admission controls for explicitly managed recording workers.",
++    )
++
+     # Detector config
+     detectors: dict[str, BaseDetectorConfig] = Field(
+         default=DEFAULT_DETECTORS,
+@@ -633,6 +653,18 @@ class FrigateConfig(FrigateBaseModel):
+         if isinstance(info.context, dict):
+             self._plus_api = info.context.get("plus_api")
+ 
++        startup_fences = self.recording_control.startup_fenced_cameras
++        unknown_fenced_cameras = set(startup_fences) - set(self.cameras)
++        if unknown_fenced_cameras:
++            raise ValueError(
++                "recording_control.startup_fenced_cameras references unknown "
++                f"cameras: {sorted(unknown_fenced_cameras)}"
++            )
++        if len(set(startup_fences)) != len(startup_fences):
++            raise ValueError(
++                "recording_control.startup_fenced_cameras contains duplicates"
++            )
++
+         # Ensure self._plus_api is set, if no explicit value is provided.
+         if self._plus_api is None:
+             self._plus_api = PlusApi()
+diff --git a/frigate/record/maintainer.py b/frigate/record/maintainer.py
+index 9ce504e..8e5f368 100644
+--- a/frigate/record/maintainer.py
++++ b/frigate/record/maintainer.py
+@@ -8,6 +8,7 @@ import random
+ import string
+ import threading
+ import time
++import uuid
+ from collections import defaultdict
+ from multiprocessing.synchronize import Event as MpEvent
+ from pathlib import Path
+@@ -18,6 +19,7 @@ import psutil
+ 
+ from frigate.comms.detections_updater import DetectionSubscriber, DetectionTypeEnum
+ from frigate.comms.inter_process import InterProcessRequestor
++from frigate.comms.recording_control_protocol import writer_set_digest
+ from frigate.comms.recordings_updater import (
+     RecordingsDataPublisher,
+     RecordingsDataTypeEnum,
+@@ -102,6 +104,13 @@ class RecordingMaintainer(threading.Thread):
+         self.audio_recordings_info: dict[str, list] = defaultdict(list)
+         self.end_time_cache: dict[str, tuple[datetime.datetime, float]] = {}
+         self.unexpected_cache_files_logged: bool = False
++        self.pending_recording_control_updates: dict[
++            str, tuple[str, str, bool, list[dict[str, Any]], str]
++        ] = {}
++        self.pending_recording_drain_barriers: dict[str, Any] = {}
++        self.worker_instance = uuid.uuid4().hex
++        self.maintenance_sequence = 0
++        self.inflight_recording_tasks = 0
+ 
+     async def move_files(self) -> None:
+         cache_files = [
+@@ -305,7 +314,13 @@ class RecordingMaintainer(threading.Thread):
+ 
+         self._expire_stale_recordings_info(grouped_recordings)
+ 
+-        recordings_to_insert: list[dict[str, Any] | None] = await asyncio.gather(*tasks)
++        self.inflight_recording_tasks = len(tasks)
++        try:
++            recordings_to_insert: list[dict[str, Any] | None] = await asyncio.gather(
++                *tasks
++            )
++        finally:
++            self.inflight_recording_tasks = 0
+ 
+         # fire and forget recordings entries
+         self.requestor.send_data(
+@@ -332,6 +347,131 @@ class RecordingMaintainer(threading.Thread):
+         Path(cache_path).unlink(missing_ok=True)
+         self.end_time_cache.pop(cache_path, None)
+ 
++    @staticmethod
++    def _has_cached_recording_segments(camera: str) -> bool | None:
++        """Return whether closed recording segments remain, or None if unreadable."""
++        try:
++            for name in os.listdir(CACHE_DIR):
++                if not name.endswith(".mp4") or name.startswith("preview_"):
++                    continue
++                camera_name = name.rsplit("@", maxsplit=1)[0]
++                if camera_name == camera:
++                    return True
++        except OSError:
++            return None
++        return False
++
++    def _ack_recording_control(
++        self,
++        camera: str,
++        request_id: str,
++        generation: str,
++        enabled: bool,
++        worker_instance: str,
++    ) -> bool:
++        """Acknowledge only after this worker applied the state and swept cache."""
++        camera_config = self.config.cameras.get(camera)
++        if (
++            camera_config is None
++            or camera_config.record.enabled is not enabled
++            or not enabled
++        ):
++            return False
++        try:
++            process = psutil.Process(os.getpid())
++            worker_identity = {"pid": process.pid, "created": process.create_time()}
++        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
++            return False
++        response = self.requestor.send_data(
++            "recording_control/ack",
++            {
++                "operation_id": request_id,
++                "camera": camera,
++                "worker": "recording_maintainer",
++                "worker_instance": worker_instance,
++                "worker_identity": worker_identity,
++                "generation": generation,
++                "phase": "enabled",
++                "record_processes": [],
++                "enabled": enabled,
++                "applied": True,
++                "cache_sweep_complete": True,
++                "inflight_tasks": self.inflight_recording_tasks,
++                "maintenance_sequence": self.maintenance_sequence,
++            },
++        )
++        return (
++            isinstance(response, dict)
++            and response.get("operation_id") == request_id
++        )
++
++    def _ack_pending_recording_controls(self, worker_instance: str) -> None:
++        """Retry correlated receipts after each successful cache sweep."""
++        for camera, pending in list(
++            self.pending_recording_control_updates.items()
++        ):
++            request_id, generation, enabled, _, _ = pending
++            if not enabled:
++                continue
++            acknowledged = self._ack_recording_control(
++                camera, request_id, generation, enabled, worker_instance
++            )
++            if (
++                acknowledged
++                and self.pending_recording_control_updates.get(camera) == pending
++            ):
++                self.pending_recording_control_updates.pop(camera, None)
++
++    def _ack_pending_recording_drain_barriers(self, worker_instance: str) -> None:
++        """Complete only barriers received after writers were confirmed stopped."""
++        for operation_id, pending_barrier in list(
++            self.pending_recording_drain_barriers.items()
++        ):
++            barrier, received_sequence = pending_barrier
++            pending = self.pending_recording_control_updates.get(barrier.camera)
++            if (
++                pending is None
++                or pending[0] != operation_id
++                or pending[1] != barrier.generation
++                or pending[2] is not False
++                or pending[4] != barrier.writer_set_digest
++                or barrier.maintainer_instance != worker_instance
++                or self.inflight_recording_tasks != 0
++                or self.maintenance_sequence <= received_sequence
++                or self._has_cached_recording_segments(barrier.camera) is not False
++            ):
++                continue
++            try:
++                process = psutil.Process(os.getpid())
++                worker_identity = {
++                    "pid": process.pid,
++                    "created": process.create_time(),
++                }
++            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
++                continue
++            response = self.requestor.send_data(
++                "recording_control/ack",
++                {
++                    "operation_id": operation_id,
++                    "camera": barrier.camera,
++                    "worker": "recording_maintainer",
++                    "worker_instance": worker_instance,
++                    "worker_identity": worker_identity,
++                    "generation": barrier.generation,
++                    "phase": "drain_complete",
++                    "barrier_id": barrier.barrier_id,
++                    "writer_set_digest": barrier.writer_set_digest,
++                    "cache_clear": True,
++                    "inflight_tasks": 0,
++                    "maintenance_sequence": self.maintenance_sequence,
++                    "enabled": False,
++                    "applied": True,
++                },
++            )
++            if isinstance(response, dict) and response.get("operation_id") == operation_id:
++                self.pending_recording_drain_barriers.pop(operation_id, None)
++                self.pending_recording_control_updates.pop(barrier.camera, None)
++
+     async def validate_and_move_segment(
+         self, camera: str, reviews: Any, recording: dict[str, Any]
+     ) -> dict[str, Any] | None:
+@@ -704,6 +844,28 @@ class RecordingMaintainer(threading.Thread):
+ 
+     def run(self) -> None:
+         # Check for new files every 5 seconds
++        worker_instance = self.worker_instance
++        try:
++            process = psutil.Process(os.getpid())
++            worker_identity = {"pid": process.pid, "created": process.create_time()}
++        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
++            worker_identity = None
++        if worker_identity is not None:
++            self.requestor.send_data(
++                "recording_control/worker_ready",
++                {
++                    "worker": "recording_maintainer",
++                    "camera": None,
++                    "worker_instance": worker_instance,
++                    "worker_identity": worker_identity,
++                    "inventory_complete": True,
++                    "record_enabled": False,
++                    "camera_enabled": False,
++                    "configured_record_output_count": 0,
++                    "record_processes": [],
++                    "writer_set_digest": writer_set_digest([]),
++                },
++            )
+         wait_time = 0.0
+         while not self.stop_event.is_set():
+             time.sleep(wait_time)
+@@ -715,6 +877,21 @@ class RecordingMaintainer(threading.Thread):
+ 
+             # check if there is an updated config
+             self.config_subscriber.check_for_updates()
++            control_updates = self.config_subscriber.drain_recording_control_updates()
++            drain_barriers = self.config_subscriber.drain_recording_drain_barriers()
++            for camera, request_id, generation, enabled, expected_writers, digest in control_updates:
++                self.pending_recording_control_updates[camera] = (
++                    request_id,
++                    generation,
++                    enabled,
++                    expected_writers,
++                    digest,
++                )
++            for barrier in drain_barriers:
++                self.pending_recording_drain_barriers[barrier.request_id] = (
++                    barrier,
++                    self.maintenance_sequence,
++                )
+ 
+             stale_frame_count = 0
+             stale_frame_count_threshold = 10
+@@ -779,13 +956,19 @@ class RecordingMaintainer(threading.Thread):
+             if stale_frame_count > 0:
+                 logger.debug(f"Found {stale_frame_count} old frames.")
+ 
++            move_files_succeeded = False
+             try:
+                 asyncio.run(self.move_files())
++                move_files_succeeded = True
+             except Exception as e:
+                 logger.error(
+                     "Error occurred when attempting to maintain recording cache"
+                 )
+                 logger.error(e)
++            if move_files_succeeded:
++                self.maintenance_sequence += 1
++                self._ack_pending_recording_controls(worker_instance)
++                self._ack_pending_recording_drain_barriers(worker_instance)
+             duration = datetime.datetime.now().timestamp() - run_start
+             wait_time = max(0, 5 - duration)
+ 
+diff --git a/frigate/test/http_api/test_http_recording_control.py b/frigate/test/http_api/test_http_recording_control.py
+new file mode 100644
+index 0000000..4b0372d
+--- /dev/null
++++ b/frigate/test/http_api/test_http_recording_control.py
+@@ -0,0 +1,127 @@
++"""Tests for the correlated recording control endpoints."""
++
++from unittest.mock import MagicMock
++
++from frigate.models import Event, Recordings, ReviewSegment
++from frigate.test.http_api.base_http_test import AuthTestClient, BaseTestHttp
++
++
++class TestRecordingControlEndpoints(BaseTestHttp):
++    def setUp(self):
++        super().setUp(models=[Event, Recordings, ReviewSegment])
++        self.app = self.create_app()
++        self.app.dispatcher = MagicMock()
++        self.app.dispatcher.begin_recording_control.return_value = {
++            "status": "pending",
++            "operation_id": "private-operation-1",
++            "camera": "front_door",
++            "enabled": False,
++            "purpose": "privacy",
++            "generation": "frigate-generation-1",
++            "acks": [],
++            "fenced": True,
++        }
++        self.app.dispatcher.recording_control_status.return_value = {
++            "status": "applied",
++            "operation_id": "private-operation-1",
++            "camera": "front_door",
++            "enabled": False,
++            "generation": "frigate-generation-1",
++            "acks": ["camera_capture", "recording_maintainer"],
++            "fenced": True,
++        }
++        self.app.dispatcher.recording_authority_status.return_value = {
++            "status": "ready",
++            "generation": "frigate-generation-1",
++            "dispatcher_identity": {"pid": 10, "created": 1234.5},
++            "fenced_cameras": ["ipc_guardiao_portao"],
++        }
++
++    def test_authority_endpoint_returns_live_generation_and_fences(self):
++        with AuthTestClient(self.app) as client:
++            response = client.get("/recordings/control/authority")
++
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual(response.json()["generation"], "frigate-generation-1")
++        self.assertEqual(response.json()["dispatcher_identity"]["pid"], 10)
++        self.assertEqual(response.json()["fenced_cameras"], ["ipc_guardiao_portao"])
++
++    def test_post_starts_correlated_control_without_claiming_success(self):
++        with AuthTestClient(self.app) as client:
++            response = client.post(
++                "/recordings/control",
++                json={
++                    "camera": "front_door",
++                    "enabled": False,
++                    "operation_id": "private-operation-1",
++                    "purpose": "privacy",
++                },
++            )
++
++        self.assertEqual(response.status_code, 202)
++        self.assertEqual(response.json()["status"], "pending")
++        self.app.dispatcher.begin_recording_control.assert_called_once_with(
++            "front_door",
++            False,
++            "private-operation-1",
++            purpose="privacy",
++        )
++
++    def test_status_endpoint_returns_worker_receipts(self):
++        with AuthTestClient(self.app) as client:
++            response = client.get(
++                "/recordings/control/private-operation-1"
++            )
++
++        self.assertEqual(response.status_code, 200)
++        result = response.json()
++        self.assertEqual(result["status"], "applied")
++        self.assertEqual(
++            set(result["acks"]), {"camera_capture", "recording_maintainer"}
++        )
++
++    def test_refused_request_remains_a_conflict(self):
++        self.app.dispatcher.begin_recording_control.return_value = {
++            "status": "hold",
++            "reason": "recording_fenced",
++        }
++        with AuthTestClient(self.app) as client:
++            response = client.post(
++                "/recordings/control",
++                json={
++                    "camera": "front_door",
++                    "enabled": True,
++                    "operation_id": "normal-on-1",
++                    "purpose": "normal",
++                },
++            )
++
++        self.assertEqual(response.status_code, 409)
++        self.assertEqual(response.json()["status"], "hold")
++
++    def test_non_admin_cannot_read_or_control_recording_authority(self):
++        viewer = {"remote-user": "test_viewer", "remote-role": "viewer"}
++        with AuthTestClient(self.app) as client:
++            authority = client.get(
++                "/recordings/control/authority", headers=viewer
++            )
++            begin = client.post(
++                "/recordings/control",
++                headers=viewer,
++                json={
++                    "camera": "front_door",
++                    "enabled": False,
++                    "operation_id": "viewer-operation-1",
++                    "purpose": "privacy",
++                },
++            )
++            status = client.get(
++                "/recordings/control/private-operation-1", headers=viewer
++            )
++
++        self.assertEqual(authority.status_code, 403)
++        self.assertEqual(begin.status_code, 403)
++        self.assertEqual(status.status_code, 403)
++        self.app.dispatcher.begin_recording_control.assert_not_called()
++        self.app.dispatcher.recording_control_status.assert_not_called()
++        self.app.dispatcher.recording_authority_status.assert_not_called()
+diff --git a/frigate/test/test_config.py b/frigate/test/test_config.py
+index 9588434..ba25e98 100644
+--- a/frigate/test/test_config.py
++++ b/frigate/test/test_config.py
+@@ -68,6 +68,36 @@ class TestConfig(unittest.TestCase):
+         assert frigate_config.detectors["cpu"].type == DetectorTypeEnum.cpu
+         assert frigate_config.detectors["cpu"].model.width == 320
+ 
++    def test_recording_startup_fence_accepts_configured_camera(self):
++        config = deep_merge(
++            {"recording_control": {"startup_fenced_cameras": ["back"]}},
++            self.minimal,
++        )
++
++        frigate_config = FrigateConfig(**config)
++
++        self.assertEqual(
++            frigate_config.recording_control.startup_fenced_cameras, ["back"]
++        )
++
++    def test_recording_startup_fence_rejects_unknown_camera(self):
++        config = deep_merge(
++            {"recording_control": {"startup_fenced_cameras": ["missing"]}},
++            self.minimal,
++        )
++
++        with self.assertRaises(ValidationError):
++            FrigateConfig(**config)
++
++    def test_recording_startup_fence_rejects_duplicate_camera(self):
++        config = deep_merge(
++            {"recording_control": {"startup_fenced_cameras": ["back", "back"]}},
++            self.minimal,
++        )
++
++        with self.assertRaises(ValidationError):
++            FrigateConfig(**config)
++
+     @patch("frigate.detectors.detector_config.load_labels")
+     def test_detector_custom_model_path(self, mock_labels):
+         mock_labels.return_value = {}
+diff --git a/frigate/test/test_dispatcher_runtime_state.py b/frigate/test/test_dispatcher_runtime_state.py
+index 0eee255..9faca78 100644
+--- a/frigate/test/test_dispatcher_runtime_state.py
++++ b/frigate/test/test_dispatcher_runtime_state.py
+@@ -2,11 +2,16 @@
+ 
+ import os
+ import tempfile
++import time
+ import unittest
++from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
++import psutil
++
+ from frigate.app import FrigateApp
+-from frigate.comms.dispatcher import Dispatcher
++from frigate.comms.dispatcher import Dispatcher, RECORDING_CONTROL_TIMEOUT_SECONDS
++from frigate.comms.recording_control_protocol import writer_set_digest
+ from frigate.comms.runtime_state import RuntimeStatePersistence
+ 
+ 
+@@ -35,20 +40,463 @@ def _make_camera_mock(
+     return camera
+ 
+ 
+-def _build_dispatcher(cameras: dict[str, MagicMock]) -> Dispatcher:
++def _build_dispatcher(
++    cameras: dict[str, MagicMock],
++    *,
++    startup_fences: list[str] | None = None,
++    communicators: list | None = None,
++) -> Dispatcher:
+     """Construct a Dispatcher with the bare-minimum mocks the tests need."""
+     config = MagicMock()
+     config.cameras = cameras
++    config.recording_control = SimpleNamespace(
++        startup_fenced_cameras=startup_fences or []
++    )
+     config_updater = MagicMock()
+     onvif = MagicMock()
+     ptz_metrics: dict = {}
+-    communicators: list = []
++    communicators_to_use = communicators if communicators is not None else []
+ 
+     with (
+         patch("frigate.comms.dispatcher.CameraActivityManager"),
+         patch("frigate.comms.dispatcher.AudioActivityManager"),
+     ):
+-        return Dispatcher(config, config_updater, onvif, ptz_metrics, communicators)
++        return Dispatcher(
++            config,
++            config_updater,
++            onvif,
++            ptz_metrics,
++            communicators_to_use,
++        )
++
++
++class TestRecordingControlDispatcher(unittest.TestCase):
++    """Exercise correlated recording fences with process-local worker receipts."""
++
++    def setUp(self) -> None:
++        self.tmp_dir = tempfile.mkdtemp()
++        self.config_path = os.path.join(self.tmp_dir, "config.yml")
++        with open(self.config_path, "w") as config_file:
++            config_file.write("")
++        self._patcher = patch(
++            "frigate.comms.runtime_state.find_config_file",
++            return_value=self.config_path,
++        )
++        self._patcher.start()
++        self.camera = _make_camera_mock(record_enabled=True)
++        self.dispatcher = _build_dispatcher({"front_door": self.camera})
++        self.dispatcher.publish = MagicMock()
++        process = psutil.Process(os.getpid())
++        self.camera_worker_identity = {
++            "pid": process.pid,
++            "created": process.create_time(),
++        }
++        self.maintainer_identity = dict(self.camera_worker_identity)
++        self.camera_worker_instance = "camera-instance-1"
++        self.maintainer_instance = "maintainer-instance-1"
++        self.synthetic_writer = {
++            "pid": os.getpid() + 50_000,
++            "created": 1_234_567.25,
++            "roles": ["record"],
++        }
++        self.synthetic_writer_exited = False
++        identity_state = self.dispatcher._identity_state
++
++        def synthetic_identity_state(identity):
++            if identity.get("pid") == self.synthetic_writer["pid"]:
++                return not self.synthetic_writer_exited
++            return identity_state(identity)
++
++        self.dispatcher._identity_state = synthetic_identity_state
++        with patch.object(self.dispatcher, "_identity_state", return_value=True):
++            self.dispatcher._on_recording_worker_ready(
++                {
++                    "worker": "camera_capture",
++                    "camera": "front_door",
++                    "worker_instance": self.camera_worker_instance,
++                    "worker_identity": self.camera_worker_identity,
++                    "inventory_complete": True,
++                    "record_enabled": True,
++                    "camera_enabled": True,
++                    "configured_record_output_count": 1,
++                    "record_processes": [self.synthetic_writer],
++                    "writer_set_digest": writer_set_digest([self.synthetic_writer]),
++                }
++            )
++            self.dispatcher._on_recording_worker_ready(
++                {
++                    "worker": "recording_maintainer",
++                    "camera": None,
++                    "worker_instance": self.maintainer_instance,
++                    "worker_identity": self.maintainer_identity,
++                    "inventory_complete": True,
++                    "record_enabled": False,
++                    "camera_enabled": False,
++                    "configured_record_output_count": 0,
++                    "record_processes": [],
++                    "writer_set_digest": writer_set_digest([]),
++                }
++            )
++
++    def tearDown(self) -> None:
++        self._patcher.stop()
++        for name in os.listdir(self.tmp_dir):
++            os.remove(os.path.join(self.tmp_dir, name))
++        os.rmdir(self.tmp_dir)
++
++    def _ack(
++        self,
++        operation_id: str,
++        worker: str,
++        enabled: bool,
++        *,
++        segment_valid: bool = True,
++        segment_start_offset: float = 0,
++    ) -> None:
++        process = psutil.Process(os.getpid())
++        requested_at = time.time() - 1
++        request = self.dispatcher._recording_control_requests[operation_id]
++        if enabled:
++            record_processes = [
++                {
++                    "pid": process.pid,
++                    "created": process.create_time(),
++                    "roles": ["record"],
++                }
++            ]
++            phase = "enabled"
++            extras = {
++                "writer_set_digest": writer_set_digest(record_processes),
++                "inventory_complete": True,
++                "configured_record_output_count": 1,
++                "cache_sweep_complete": worker == "recording_maintainer",
++                "inflight_tasks": 0,
++                "maintenance_sequence": 1,
++            }
++            recording_segment = (
++                {
++                    "camera": "front_door",
++                    "start_time": requested_at + 1 + segment_start_offset,
++                    "requested_at": requested_at,
++                }
++                if worker == "camera_capture" and segment_valid
++                else None
++            )
++        elif worker == "camera_capture":
++            record_processes = []
++            phase = "writers_stopped"
++            self.synthetic_writer_exited = True
++            exits = [
++                {**item, "exit_observed": True, "exit_code": -15}
++                for item in request["expected_writers"]
++            ]
++            extras = {
++                "writer_set_digest": request["writer_set_digest"],
++                "inventory_complete": True,
++                "writer_exit_receipts": exits,
++            }
++            recording_segment = None
++        else:
++            record_processes = []
++            phase = "drain_complete"
++            extras = {
++                "barrier_id": request["barrier_id"],
++                "writer_set_digest": request["writer_set_digest"],
++                "cache_clear": True,
++                "inflight_tasks": 0,
++                "maintenance_sequence": 1,
++            }
++            recording_segment = None
++        payload = {
++            "operation_id": operation_id,
++            "camera": "front_door",
++            "worker": worker,
++            "worker_instance": request["worker_instances"][worker],
++            "worker_identity": (
++                self.camera_worker_identity
++                if worker == "camera_capture"
++                else self.maintainer_identity
++            ),
++            "record_processes": record_processes,
++            "enabled": enabled,
++            "applied": True,
++            "recording_segment": recording_segment,
++            "phase": phase,
++            "generation": request["generation"],
++            **extras,
++        }
++        self.dispatcher._receive("recording_control/ack", payload)
++
++    def test_privacy_off_requires_both_worker_receipts_and_keeps_fence(self) -> None:
++        result = self.dispatcher.begin_recording_control(
++            "front_door", False, "private-op-1", purpose="privacy"
++        )
++
++        self.assertEqual(result["status"], "pending")
++        self.assertEqual(result["purpose"], "privacy")
++        self.assertTrue(self.dispatcher._recording_fences.__contains__("front_door"))
++        self._ack("private-op-1", "camera_capture", False)
++        self.assertEqual(self.dispatcher.config_updater.publish_update.call_count, 2)
++        stop_update = self.dispatcher.config_updater.publish_update.call_args_list[0].args[1]
++        drain_update = self.dispatcher.config_updater.publish_update.call_args_list[1].args[1]
++        self.assertEqual(type(stop_update).__name__, "RecordingControlUpdate")
++        self.assertEqual(type(drain_update).__name__, "RecordingDrainBarrier")
++        self.assertEqual(stop_update.request_id, "private-op-1")
++        self.assertEqual(drain_update.request_id, stop_update.request_id)
++        self.assertEqual(drain_update.generation, stop_update.generation)
++        self.assertEqual(drain_update.writer_set_digest, stop_update.writer_set_digest)
++        self.assertEqual(
++            self.dispatcher.recording_control_status("private-op-1")["status"],
++            "pending",
++        )
++        self._ack("private-op-1", "recording_maintainer", False)
++
++        status = self.dispatcher.recording_control_status("private-op-1")
++        self.assertEqual(status["status"], "applied")
++        self.assertTrue(status["fenced"])
++        self.assertEqual(self.dispatcher.config_updater.publish_update.call_count, 2)
++
++    def test_normal_on_is_rejected_while_privacy_fence_is_active(self) -> None:
++        self.dispatcher.begin_recording_control(
++            "front_door", False, "private-op-2", purpose="privacy"
++        )
++        update_count = self.dispatcher.config_updater.publish_update.call_count
++
++        result = self.dispatcher.begin_recording_control(
++            "front_door", True, "normal-on-1", purpose="normal"
++        )
++
++        self.assertEqual(result["status"], "hold")
++        self.assertEqual(result["reason"], "recording_fenced")
++        self.assertEqual(
++            self.dispatcher.config_updater.publish_update.call_count,
++            update_count,
++        )
++
++    def test_normal_on_applies_only_after_live_workers_and_valid_segment(self) -> None:
++        result = self.dispatcher.begin_recording_control(
++            "front_door", True, "normal-on-1", purpose="normal"
++        )
++
++        self.assertEqual(result["status"], "pending")
++        self.assertTrue(result["fenced"])
++        self.assertEqual(
++            self.dispatcher._runtime_state.load(),
++            {"front_door": {"recordings": True}},
++        )
++        self._ack("normal-on-1", "camera_capture", True)
++        self.assertEqual(
++            self.dispatcher.recording_control_status("normal-on-1")["status"],
++            "pending",
++        )
++        self._ack("normal-on-1", "recording_maintainer", True)
++
++        status = self.dispatcher.recording_control_status("normal-on-1")
++        self.assertEqual(status["status"], "applied")
++        self.assertFalse(status["fenced"])
++        self.dispatcher.publish.assert_called_with(
++            "front_door/recordings/state", "ON", retain=True
++        )
++
++    def test_startup_fence_is_persisted_before_mqtt_subscriptions(self) -> None:
++        camera = _make_camera_mock(record_enabled=True)
++        communicator = MagicMock()
++        with (
++            patch.object(
++                RuntimeStatePersistence,
++                "load_recording_fences",
++                return_value=(set(), True),
++            ),
++            patch.object(
++                RuntimeStatePersistence, "set_recording_fence", return_value=True
++            ) as persist_fence,
++        ):
++            communicator.subscribe.side_effect = lambda _callback: self.assertEqual(
++                persist_fence.call_count, 1
++            )
++            dispatcher = _build_dispatcher(
++                {"front_door": camera},
++                startup_fences=["front_door"],
++                communicators=[communicator],
++            )
++
++        self.assertIn("front_door", dispatcher._recording_fences)
++        self.assertFalse(camera.record.enabled)
++        persist_fence.assert_called_once_with("front_door", True)
++        communicator.subscribe.assert_called_once()
++
++    def test_failed_startup_fence_persistence_fences_all_cameras(self) -> None:
++        cameras = {
++            "front_door": _make_camera_mock(record_enabled=True),
++            "back_yard": _make_camera_mock(record_enabled=True),
++        }
++        with (
++            patch.object(
++                RuntimeStatePersistence,
++                "load_recording_fences",
++                return_value=(set(), True),
++            ),
++            patch.object(
++                RuntimeStatePersistence, "set_recording_fence", return_value=False
++            ),
++        ):
++            dispatcher = _build_dispatcher(
++                cameras, startup_fences=["front_door"]
++            )
++
++        self.assertEqual(dispatcher._recording_fences, set(cameras))
++        self.assertTrue(all(not camera.record.enabled for camera in cameras.values()))
++
++    def test_restore_on_clears_fence_only_after_both_live_worker_receipts(self) -> None:
++        self.dispatcher.begin_recording_control(
++            "front_door", False, "private-op-3", purpose="privacy"
++        )
++        self._ack("private-op-3", "camera_capture", False)
++        self._ack("private-op-3", "recording_maintainer", False)
++
++        result = self.dispatcher.begin_recording_control(
++            "front_door", True, "restore-op-3", purpose="restore"
++        )
++        self.assertEqual(result["status"], "pending")
++        self.assertTrue(result["fenced"])
++        self._ack("restore-op-3", "camera_capture", True)
++        self.assertTrue(
++            self.dispatcher.recording_control_status("restore-op-3")["fenced"]
++        )
++        self._ack("restore-op-3", "recording_maintainer", True)
++
++        status = self.dispatcher.recording_control_status("restore-op-3")
++        self.assertEqual(status["status"], "applied")
++        self.assertFalse(status["fenced"])
++        self.assertGreaterEqual(
++            status["worker_receipts"]["camera_capture"]["recording_segment"][
++                "start_time"
++            ],
++            status["worker_receipts"]["camera_capture"]["recording_segment"][
++                "requested_at"
++            ],
++        )
++
++    def test_authority_status_reports_live_generation_and_process_identity(self) -> None:
++        result = self.dispatcher.recording_authority_status()
++
++        self.assertEqual(result["status"], "ready")
++        self.assertTrue(result["generation"])
++        self.assertEqual(
++            result["dispatcher_identity"]["pid"], os.getpid()
++        )
++        self.assertEqual(result["fenced_cameras"], [])
++
++    def test_worker_readiness_rechecks_inventory_digest(self) -> None:
++        camera_worker = self.dispatcher._recording_worker_registry[
++            "camera_capture:front_door"
++        ]
++        camera_worker["record_processes"] = []
++
++        ready, reason = self.dispatcher._recording_workers_ready()
++
++        self.assertFalse(ready)
++        self.assertEqual(reason, "worker_inventory_digest_mismatch")
++
++    def test_malformed_process_identity_fails_closed_without_exception(self) -> None:
++        for identity in (
++            {"pid": 0, "created": 1.0},
++            {"pid": -1, "created": 1.0},
++            {"pid": True, "created": 1.0},
++            {"pid": os.getpid(), "created": float("nan")},
++        ):
++            with self.subTest(identity=identity):
++                self.assertIsNone(self.dispatcher._identity_state(identity))
++
++    def test_restore_on_rejects_capture_receipt_without_valid_new_segment(self) -> None:
++        self.dispatcher.begin_recording_control(
++            "front_door", False, "private-op-no-segment", purpose="privacy"
++        )
++        self._ack("private-op-no-segment", "camera_capture", False)
++        self._ack("private-op-no-segment", "recording_maintainer", False)
++
++        result = self.dispatcher.begin_recording_control(
++            "front_door", True, "restore-op-no-segment", purpose="restore"
++        )
++        self.assertEqual(result["status"], "pending")
++
++        self._ack(
++            "restore-op-no-segment",
++            "camera_capture",
++            True,
++            segment_valid=False,
++        )
++        status = self.dispatcher.recording_control_status("restore-op-no-segment")
++        self.assertEqual(status["status"], "pending")
++        self.assertNotIn("camera_capture", self.dispatcher._recording_control_requests[
++            "restore-op-no-segment"
++        ]["acks"])
++        self.assertTrue(status["fenced"])
++
++    def test_restore_on_rejects_segment_preceding_enable_request(self) -> None:
++        self.dispatcher.begin_recording_control(
++            "front_door", False, "private-op-old-segment", purpose="privacy"
++        )
++        self._ack("private-op-old-segment", "camera_capture", False)
++        self._ack("private-op-old-segment", "recording_maintainer", False)
++
++        self.dispatcher.begin_recording_control(
++            "front_door", True, "restore-op-old-segment", purpose="restore"
++        )
++        self._ack(
++            "restore-op-old-segment",
++            "camera_capture",
++            True,
++            segment_start_offset=-60,
++        )
++
++        request = self.dispatcher._recording_control_requests[
++            "restore-op-old-segment"
++        ]
++        self.assertEqual(request["status"], "pending")
++        self.assertNotIn("camera_capture", request["acks"])
++        self.assertTrue(self.dispatcher._recording_fences.__contains__("front_door"))
++
++    def test_expired_on_status_preserves_fence_and_starts_protective_off(self) -> None:
++        result = self.dispatcher.begin_recording_control(
++            "front_door", True, "normal-on-expired", purpose="normal"
++        )
++        self.assertEqual(result["status"], "pending")
++        request = self.dispatcher._recording_control_requests[
++            "normal-on-expired"
++        ]
++        request["started_monotonic"] = (
++            time.monotonic() - RECORDING_CONTROL_TIMEOUT_SECONDS - 1
++        )
++
++        status = self.dispatcher.recording_control_status("normal-on-expired")
++
++        self.assertEqual(status["status"], "hold")
++        self.assertEqual(status["reason"], "worker_ack_timeout")
++        self.assertTrue(status["fenced"])
++        self.assertTrue(status["reassert_operation_id"])
++        self.assertEqual(status["reassert_status"], "pending")
++        self.assertNotIn("camera_capture", request["acks"])
++
++    def test_late_on_ack_after_deadline_cannot_release_fence(self) -> None:
++        self.dispatcher.begin_recording_control(
++            "front_door", True, "normal-on-late-ack", purpose="normal"
++        )
++        request = self.dispatcher._recording_control_requests[
++            "normal-on-late-ack"
++        ]
++        request["started_monotonic"] = (
++            time.monotonic() - RECORDING_CONTROL_TIMEOUT_SECONDS - 1
++        )
++
++        self._ack("normal-on-late-ack", "camera_capture", True)
++        status = self.dispatcher.recording_control_status("normal-on-late-ack")
++
++        self.assertEqual(status["status"], "hold")
++        self.assertEqual(status["reason"], "worker_ack_timeout")
++        self.assertTrue(status["fenced"])
++        self.assertNotIn("camera_capture", request["acks"])
++        self.assertTrue(status["reassert_operation_id"])
+ 
+ 
+ class TestRestoreRuntimeState(unittest.TestCase):
+@@ -205,9 +653,10 @@ class TestHandlersPersistViaSet(unittest.TestCase):
+         self.dispatcher._on_detect_command("front_door", "ON")
+         self.assertEqual(self._stored_state(), {"front_door": {"detect": True}})
+ 
+-    def test_recordings_handler_persists(self) -> None:
++    def test_recordings_handler_refuses_on_without_live_workers(self) -> None:
+         self.dispatcher._on_recordings_command("front_door", "ON")
+-        self.assertEqual(self._stored_state(), {"front_door": {"recordings": True}})
++        self.assertEqual(self._stored_state(), {})
++        self.assertFalse(self.cameras["front_door"].record.enabled)
+ 
+     def test_snapshots_handler_persists(self) -> None:
+         self.dispatcher._on_snapshots_command("front_door", "ON")
+diff --git a/frigate/test/test_recording_control_barrier_protocol.py b/frigate/test/test_recording_control_barrier_protocol.py
+new file mode 100644
+index 0000000..22921ae
+--- /dev/null
++++ b/frigate/test/test_recording_control_barrier_protocol.py
+@@ -0,0 +1,203 @@
++"""Dependency-light tests for the recording stop/drain receipt contract."""
++
++import unittest
++
++from frigate.comms.recording_control_protocol import (
++    RecordingOffBarrier,
++    validate_drain_receipt,
++    validate_writer_exit_receipts,
++    writer_set_digest,
++)
++
++
++class TestRecordingControlBarrierProtocol(unittest.TestCase):
++    def setUp(self) -> None:
++        self.writers = [
++            {"pid": 101, "created": 1_000.25, "roles": ["detect", "record"]},
++            {"pid": 202, "created": 1_001.5, "roles": ["record"]},
++        ]
++        self.digest = writer_set_digest(self.writers)
++
++    def test_exit_receipts_must_match_complete_expected_set(self) -> None:
++        receipts = [
++            {**writer, "exit_observed": True, "exit_code": 0}
++            for writer in self.writers
++        ]
++        self.assertTrue(
++            validate_writer_exit_receipts(
++                self.writers,
++                self.digest,
++                receipts,
++                inventory_complete=True,
++            )
++        )
++
++    def test_missing_duplicate_or_unobserved_writer_exit_is_rejected(self) -> None:
++        base = [
++            {**writer, "exit_observed": True, "exit_code": 0}
++            for writer in self.writers
++        ]
++        for invalid in (
++            base[:1],
++            [*base, base[0]],
++            [{**base[0], "exit_observed": False}, base[1]],
++            [{**base[0], "exit_code": None}, base[1]],
++        ):
++            with self.subTest(invalid=invalid):
++                self.assertFalse(
++                    validate_writer_exit_receipts(
++                        self.writers,
++                        self.digest,
++                        invalid,
++                        inventory_complete=True,
++                    )
++                )
++
++    def test_empty_inventory_requires_an_explicit_complete_snapshot(self) -> None:
++        empty_digest = writer_set_digest([])
++        self.assertEqual(len(empty_digest), 64)
++        self.assertTrue(
++            validate_writer_exit_receipts(
++                [], empty_digest, [], inventory_complete=True
++            )
++        )
++        self.assertFalse(
++            validate_writer_exit_receipts(
++                [], empty_digest, [], inventory_complete=False
++            )
++        )
++
++    def test_digest_rejects_malformed_and_duplicate_identities(self) -> None:
++        self.assertIsNone(writer_set_digest([{"pid": 0, "created": 1, "roles": ["record"]}]))
++        self.assertIsNone(writer_set_digest([self.writers[0], self.writers[0]]))
++        self.assertIsNone(writer_set_digest([{"pid": 1, "created": 1, "roles": ["detect"]}]))
++
++    def test_drain_receipt_is_correlated_to_generation_and_barrier(self) -> None:
++        receipt = {
++            "phase": "drain_complete",
++            "operation_id": "private-1",
++            "generation": "generation-1",
++            "camera": "guard",
++            "barrier_id": "barrier-1",
++            "writer_set_digest": self.digest,
++            "worker_instance": "maintainer-1",
++            "cache_clear": True,
++            "inflight_tasks": 0,
++            "maintenance_sequence": 3,
++        }
++        expected = {
++            "operation_id": "private-1",
++            "generation": "generation-1",
++            "camera": "guard",
++            "barrier_id": "barrier-1",
++            "writer_digest": self.digest,
++            "worker_instance": "maintainer-1",
++        }
++        self.assertTrue(validate_drain_receipt(receipt, **expected))
++        for key, value in (("generation", "old-generation"), ("barrier_id", "old-barrier"), ("cache_clear", False)):
++            with self.subTest(key=key):
++                invalid = dict(receipt, **{key: value})
++                self.assertFalse(validate_drain_receipt(invalid, **expected))
++
++    def _new_barrier(self) -> RecordingOffBarrier:
++        return RecordingOffBarrier(
++            "private-1", "generation-1", "guard", self.writers, self.digest
++        )
++
++    def _writer_stop_receipt(self) -> dict:
++        return {
++            "phase": "writers_stopped",
++            "operation_id": "private-1",
++            "generation": "generation-1",
++            "camera": "guard",
++            "worker": "camera_capture",
++            "worker_instance": "capture-1",
++            "enabled": False,
++            "applied": True,
++            "inventory_complete": True,
++            "writer_set_digest": self.digest,
++            "record_processes": [],
++            "writer_exit_receipts": [
++                {**writer, "exit_observed": True, "exit_code": -15}
++                for writer in self.writers
++            ],
++        }
++
++    def test_barrier_enforces_stop_then_drain_order_and_same_generation(self) -> None:
++        protocol = self._new_barrier()
++        premature_drain = {
++            "phase": "drain_complete",
++            "operation_id": "private-1",
++            "generation": "generation-1",
++            "camera": "guard",
++            "barrier_id": "not-issued",
++            "writer_set_digest": self.digest,
++            "worker_instance": "maintainer-1",
++            "cache_clear": True,
++            "inflight_tasks": 0,
++            "maintenance_sequence": 1,
++        }
++        self.assertFalse(
++            protocol.accept_drain_complete(
++                premature_drain, expected_worker_instance="maintainer-1"
++            )
++        )
++        self.assertEqual(protocol.phase, "config_pending")
++
++        self.assertTrue(
++            protocol.accept_writers_stopped(
++                self._writer_stop_receipt(),
++                expected_worker_instance="capture-1",
++                processes_exited=True,
++            )
++        )
++        self.assertEqual(protocol.phase, "writers_stopped")
++        drain = dict(premature_drain, barrier_id=protocol.barrier_id)
++        self.assertTrue(
++            protocol.accept_drain_complete(
++                drain, expected_worker_instance="maintainer-1"
++            )
++        )
++        self.assertEqual(protocol.phase, "drain_complete")
++        self.assertFalse(
++            protocol.accept_writers_stopped(
++                self._writer_stop_receipt(),
++                expected_worker_instance="capture-1",
++                processes_exited=True,
++            )
++        )
++
++    def test_barrier_rejects_processes_not_confirmed_exited_and_stale_generation(self) -> None:
++        protocol = self._new_barrier()
++        self.assertFalse(
++            protocol.accept_writers_stopped(
++                self._writer_stop_receipt(),
++                expected_worker_instance="capture-1",
++                processes_exited=False,
++            )
++        )
++        stale = dict(self._writer_stop_receipt(), generation="old-generation")
++        self.assertFalse(
++            protocol.accept_writers_stopped(
++                stale,
++                expected_worker_instance="capture-1",
++                processes_exited=True,
++            )
++        )
++        self.assertEqual(protocol.phase, "config_pending")
++
++    def test_barrier_invalidation_is_terminal(self) -> None:
++        protocol = self._new_barrier()
++        protocol.invalidate("worker_restarted")
++        self.assertEqual(protocol.phase, "hold_unreconciled")
++        self.assertFalse(
++            protocol.accept_writers_stopped(
++                self._writer_stop_receipt(),
++                expected_worker_instance="capture-1",
++                processes_exited=True,
++            )
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/frigate/test/test_recording_control_workers.py b/frigate/test/test_recording_control_workers.py
+new file mode 100644
+index 0000000..ecdd503
+--- /dev/null
++++ b/frigate/test/test_recording_control_workers.py
+@@ -0,0 +1,344 @@
++"""Focused tests for worker-side recording-control receipts and barriers."""
++
++import logging
++import os
++import shutil
++import subprocess
++import tempfile
++import time
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++from frigate.comms.recording_control_protocol import writer_set_digest
++from frigate.config.camera.updater import RecordingDrainBarrier
++from frigate.record.maintainer import RecordingMaintainer
++from frigate.video.ffmpeg import CameraWatchdog
++
++
++class TestCameraWatchdogRecordingControl(unittest.TestCase):
++    def setUp(self) -> None:
++        self.worker = object.__new__(CameraWatchdog)
++        self.worker.config = MagicMock()
++        self.worker.config.name = "guard"
++        self.worker.config.enabled = True
++        self.worker.config.record.enabled = True
++        self.worker.worker_instance = "camera-worker-instance"
++        self.worker.requestor = MagicMock()
++        self.worker.pending_recording_control_updates = []
++        self.writer = {
++            "pid": os.getpid(),
++            "created": 1_000.0,
++            "roles": ["record"],
++        }
++        self.worker._record_output_inventory = MagicMock(
++            return_value=([self.writer], True, 1)
++        )
++        self.worker._ack_recording_control = MagicMock(
++            wraps=CameraWatchdog._ack_recording_control.__get__(self.worker)
++        )
++
++    def test_on_waits_for_valid_segment_after_request(self) -> None:
++        empty_digest = writer_set_digest([])
++        with patch("frigate.video.ffmpeg.time.time", return_value=1000.0):
++            self.worker._queue_recording_control_ack(
++                "on-1", "generation-1", True, [], empty_digest
++            )
++
++        self.worker._ack_recording_control.assert_not_called()
++        self.worker._ack_valid_recording_segment("guard", 999.0)
++        self.worker._ack_recording_control.assert_not_called()
++
++        self.worker._ack_valid_recording_segment("guard", 1001.0)
++        self.worker._ack_recording_control.assert_called_once()
++        args, kwargs = self.worker._ack_recording_control.call_args
++        self.assertEqual(args, ("on-1", "generation-1", True))
++        self.assertEqual(kwargs["recording_segment"]["camera"], "guard")
++        self.assertEqual(kwargs["recording_segment"]["start_time"], 1001.0)
++        self.assertEqual(self.worker.pending_recording_control_updates, [])
++        self.worker.requestor.send_data.assert_called_once()
++
++    def test_off_ack_contains_complete_exact_writer_exit_inventory(self) -> None:
++        digest = writer_set_digest([self.writer])
++        exited = {**self.writer, "exit_observed": True, "exit_code": -15}
++        self.worker._queue_recording_control_ack(
++            "off-1",
++            "generation-1",
++            False,
++            [self.writer],
++            digest,
++            writer_exit_receipts=[exited],
++            inventory_complete=True,
++        )
++
++        payload = self.worker.requestor.send_data.call_args.args[1]
++        self.assertEqual(payload["phase"], "writers_stopped")
++        self.assertEqual(payload["generation"], "generation-1")
++        self.assertEqual(payload["writer_exit_receipts"], [exited])
++        self.assertTrue(payload["inventory_complete"])
++        self.assertEqual(payload["record_processes"], [])
++
++    def test_off_ack_fails_closed_on_incomplete_or_wrong_writer_set(self) -> None:
++        digest = writer_set_digest([self.writer])
++        self.worker._queue_recording_control_ack(
++            "off-incomplete",
++            "generation-1",
++            False,
++            [self.writer],
++            digest,
++            writer_exit_receipts=[],
++            inventory_complete=False,
++        )
++        payload = self.worker.requestor.send_data.call_args.args[1]
++        self.assertFalse(payload["inventory_complete"])
++
++
++class TestRecordingMaintainerRecordingControl(unittest.TestCase):
++    def setUp(self) -> None:
++        self.worker = object.__new__(RecordingMaintainer)
++        self.worker.config = MagicMock()
++        camera = MagicMock()
++        camera.record.enabled = True
++        self.worker.config.cameras = {"guard": camera}
++        self.worker.requestor = MagicMock()
++        self.worker.requestor.send_data.side_effect = (
++            lambda _topic, payload: {"operation_id": payload["operation_id"]}
++        )
++        self.worker.worker_instance = "maintainer-1"
++        self.worker.maintenance_sequence = 4
++        self.worker.inflight_recording_tasks = 0
++        self.worker.pending_recording_control_updates = {}
++        self.worker.pending_recording_drain_barriers = {}
++
++    def test_on_receipt_is_after_completed_maintenance_cycle(self) -> None:
++        acknowledged = self.worker._ack_recording_control(
++            "guard", "on-1", "generation-1", True, "maintainer-1"
++        )
++        self.assertTrue(acknowledged)
++        payload = self.worker.requestor.send_data.call_args.args[1]
++        self.assertEqual(payload["phase"], "enabled")
++        self.assertEqual(payload["generation"], "generation-1")
++        self.assertEqual(payload["maintenance_sequence"], 4)
++        self.assertEqual(payload["inflight_tasks"], 0)
++
++    def test_off_drain_ack_requires_barrier_and_post_barrier_sweep(self) -> None:
++        writer_set = [{"pid": os.getpid(), "created": 1_000.0, "roles": ["record"]}]
++        digest = writer_set_digest(writer_set)
++        barrier = RecordingDrainBarrier(
++            "off-1", "generation-1", "guard", "barrier-1", digest, "maintainer-1"
++        )
++        self.worker.pending_recording_control_updates["guard"] = (
++            "off-1",
++            "generation-1",
++            False,
++            writer_set,
++            digest,
++        )
++        self.worker.pending_recording_drain_barriers["off-1"] = (barrier, 3)
++        self.worker.maintenance_sequence = 4
++        with patch.object(
++            RecordingMaintainer,
++            "_has_cached_recording_segments",
++            return_value=False,
++        ):
++            self.worker._ack_pending_recording_drain_barriers("maintainer-1")
++
++        payload = self.worker.requestor.send_data.call_args.args[1]
++        self.assertEqual(payload["phase"], "drain_complete")
++        self.assertEqual(payload["operation_id"], "off-1")
++        self.assertEqual(payload["barrier_id"], "barrier-1")
++        self.assertEqual(payload["maintenance_sequence"], 4)
++        self.assertEqual(self.worker.pending_recording_drain_barriers, {})
++        self.assertEqual(self.worker.pending_recording_control_updates, {})
++
++    def test_off_drain_ack_remains_pending_if_cache_is_not_clear(self) -> None:
++        digest = writer_set_digest([])
++        barrier = RecordingDrainBarrier(
++            "off-2", "generation-1", "guard", "barrier-2", digest, "maintainer-1"
++        )
++        self.worker.pending_recording_control_updates["guard"] = (
++            "off-2",
++            "generation-1",
++            False,
++            [],
++            digest,
++        )
++        self.worker.pending_recording_drain_barriers["off-2"] = (barrier, 1)
++        self.worker.maintenance_sequence = 2
++        with patch.object(
++            RecordingMaintainer,
++            "_has_cached_recording_segments",
++            return_value=True,
++        ):
++            self.worker._ack_pending_recording_drain_barriers("maintainer-1")
++
++        self.worker.requestor.send_data.assert_not_called()
++        self.assertIn("off-2", self.worker.pending_recording_drain_barriers)
++
++
++@unittest.skipUnless(os.name == "posix", "Frigate worker process test requires Linux")
++class TestLinuxRecordingWorkerProcessBarrier(unittest.TestCase):
++    def test_real_ffmpeg_exit_precedes_maintainer_drain_receipt(self) -> None:
++        ffmpeg_candidates = sorted(Path("/usr/lib/ffmpeg").glob("*/bin/ffmpeg"))
++        ffmpeg = next((path for path in reversed(ffmpeg_candidates) if path.is_file()), None)
++        if ffmpeg is None:
++            self.skipTest("pinned Frigate Linux image has no bundled FFmpeg executable")
++
++        temp_parent = os.environ.get("TMPDIR")
++        with tempfile.TemporaryDirectory(
++            prefix="frigate-recording-barrier-", dir=temp_parent
++        ) as temp_dir:
++            root = Path(temp_dir)
++            cache_dir = root / "cache"
++            recordings_dir = root / "recordings"
++            cache_dir.mkdir()
++            recordings_dir.mkdir()
++            segment = cache_dir / "guard@synthetic.mp4"
++            process = subprocess.Popen(
++                [
++                    str(ffmpeg),
++                    "-hide_banner",
++                    "-loglevel",
++                    "error",
++                    "-re",
++                    "-f",
++                    "lavfi",
++                    "-i",
++                    "testsrc=size=64x64:rate=2",
++                    "-an",
++                    "-c:v",
++                    "mpeg4",
++                    "-threads",
++                    "1",
++                    "-movflags",
++                    "+frag_keyframe+empty_moov",
++                    "-flush_packets",
++                    "1",
++                    "-t",
++                    "3600",
++                    "-f",
++                    "mp4",
++                    str(segment),
++                ],
++                stdin=subprocess.DEVNULL,
++                stdout=subprocess.DEVNULL,
++                stderr=subprocess.PIPE,
++                start_new_session=True,
++            )
++            try:
++                deadline = time.monotonic() + 30
++                while time.monotonic() < deadline:
++                    if process.poll() is not None:
++                        self.fail("synthetic FFmpeg exited before the OFF request")
++                    if segment.exists() and segment.stat().st_size > 0:
++                        break
++                    time.sleep(0.05)
++                self.assertTrue(segment.exists())
++                self.assertGreater(segment.stat().st_size, 0)
++
++                worker = object.__new__(CameraWatchdog)
++                worker.logger = logging.getLogger(__name__)
++                worker.config = SimpleNamespace(
++                    name="guard",
++                    enabled=True,
++                    record=SimpleNamespace(enabled=True),
++                    ffmpeg_cmds=[{"roles": ["record"]}],
++                )
++                worker.capture_thread = None
++                worker.ffmpeg_detect_process = process
++                worker.ffmpeg_detect_roles = ["record"]
++                worker.ffmpeg_detect_identity = CameraWatchdog._process_identity(
++                    process, ["record"]
++                )
++                writer_identity = worker.ffmpeg_detect_identity
++                worker.worker_instance = "camera-worker-1"
++                worker.ffmpeg_other_processes = []
++                worker.requestor = MagicMock()
++                worker.pending_recording_control_updates = []
++
++                writers, inventory_complete, configured_count = (
++                    worker._record_output_inventory()
++                )
++                self.assertTrue(inventory_complete)
++                self.assertEqual(configured_count, 1)
++                self.assertEqual(writers, [worker.ffmpeg_detect_identity])
++                digest = writer_set_digest(writers)
++                self.assertIsNotNone(digest)
++
++                stop_result = worker.stop_all_ffmpeg()
++                self.assertIsNotNone(process.poll())
++                self.assertTrue(stop_result["inventory_complete"])
++                self.assertEqual(
++                    stop_result["writer_exit_receipts"],
++                    [
++                        {
++                            **writer_identity,
++                            "exit_observed": True,
++                            "exit_code": process.returncode,
++                        }
++                    ],
++                )
++                worker._queue_recording_control_ack(
++                    "operation-1",
++                    "generation-1",
++                    False,
++                    writers,
++                    digest,
++                    writer_exit_receipts=stop_result["writer_exit_receipts"],
++                    inventory_complete=stop_result["inventory_complete"],
++                )
++                stopped_receipt = worker.requestor.send_data.call_args.args[1]
++                self.assertEqual(stopped_receipt["phase"], "writers_stopped")
++                self.assertTrue(stopped_receipt["inventory_complete"])
++                self.assertEqual(stopped_receipt["writer_exit_receipts"][0]["pid"], process.pid)
++
++                maintainer = object.__new__(RecordingMaintainer)
++                maintainer.requestor = MagicMock()
++                maintainer.requestor.send_data.side_effect = (
++                    lambda _topic, payload: {"operation_id": payload["operation_id"]}
++                )
++                maintainer.worker_instance = "maintainer-1"
++                maintainer.maintenance_sequence = 2
++                maintainer.inflight_recording_tasks = 0
++                maintainer.pending_recording_control_updates = {
++                    "guard": ("operation-1", "generation-1", False, writers, digest)
++                }
++                maintainer.pending_recording_drain_barriers = {
++                    "operation-1": (
++                        RecordingDrainBarrier(
++                            "operation-1",
++                            "generation-1",
++                            "guard",
++                            "barrier-1",
++                            digest,
++                            "maintainer-1",
++                        ),
++                        1,
++                    )
++                }
++
++                with patch("frigate.record.maintainer.CACHE_DIR", str(cache_dir)):
++                    maintainer._ack_pending_recording_drain_barriers("maintainer-1")
++                    maintainer.requestor.send_data.assert_not_called()
++                    self.assertIn("operation-1", maintainer.pending_recording_drain_barriers)
++
++                    shutil.move(str(segment), recordings_dir / segment.name)
++                    maintainer.maintenance_sequence += 1
++                    maintainer._ack_pending_recording_drain_barriers("maintainer-1")
++
++                drain_receipt = maintainer.requestor.send_data.call_args.args[1]
++                self.assertEqual(drain_receipt["phase"], "drain_complete")
++                self.assertEqual(drain_receipt["operation_id"], "operation-1")
++                self.assertEqual(drain_receipt["generation"], "generation-1")
++                self.assertEqual(drain_receipt["barrier_id"], "barrier-1")
++                self.assertEqual(drain_receipt["writer_set_digest"], digest)
++                self.assertFalse(maintainer.pending_recording_drain_barriers)
++            finally:
++                if process.poll() is None:
++                    process.kill()
++                    process.communicate()
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/frigate/test/test_runtime_state.py b/frigate/test/test_runtime_state.py
+index 5a373ad..979871c 100644
+--- a/frigate/test/test_runtime_state.py
++++ b/frigate/test/test_runtime_state.py
+@@ -72,6 +72,49 @@ class TestRuntimeStatePersistence(unittest.TestCase):
+             json.dump(["unexpected", "list"], f)
+         self.assertEqual(self.store.load(), {})
+ 
++    def test_recording_fence_round_trips_and_coexists_with_runtime_state(self) -> None:
++        self.assertEqual(self.store.load_recording_fences(), (set(), True))
++        self.assertTrue(self.store.set_recording_fence("front_door", True))
++        self.store.set("front_door", "recordings", True)
++        self.assertEqual(
++            self.store.load_recording_fences(), ({"front_door"}, True)
++        )
++        self.assertEqual(
++            self.store.load(), {"front_door": {"recordings": True}}
++        )
++        self.assertTrue(self.store.set_recording_fence("front_door", False))
++        self.assertEqual(self.store.load_recording_fences(), (set(), True))
++
++    def test_corrupt_fence_state_is_not_interpreted_as_unfenced(self) -> None:
++        runtime_path = os.path.join(self.tmp_dir, ".runtime_state.json")
++        with open(runtime_path, "w") as f:
++            f.write("{not valid json")
++
++        self.assertEqual(self.store.load_recording_fences(), (set(), False))
++        self.assertFalse(self.store.set_recording_fence("front_door", False))
++        with open(runtime_path) as f:
++            self.assertEqual(f.read(), "{not valid json")
++
++    def test_clear_all_preserves_durable_recording_fences(self) -> None:
++        self.store.set("front_door", "detect", False)
++        self.store.set_recording_fence("front_door", True)
++
++        self.store.clear_all()
++
++        self.assertEqual(self.store.load(), {})
++        self.assertEqual(
++            self.store.load_recording_fences(), ({"front_door"}, True)
++        )
++
++    def test_invalid_root_shape_cannot_be_replaced_by_fence_write(self) -> None:
++        runtime_path = os.path.join(self.tmp_dir, ".runtime_state.json")
++        with open(runtime_path, "w") as f:
++            json.dump(["invalid-root"], f)
++
++        self.assertFalse(self.store.set_recording_fence("front_door", True))
++        with open(runtime_path) as f:
++            self.assertEqual(json.load(f), ["invalid-root"])
++
+     def test_clear_for_yaml_keys_removes_matching_entries(self) -> None:
+         self.store.set("front_door", "detect", False)
+         self.store.set("front_door", "recordings", False)
+diff --git a/frigate/video/ffmpeg.py b/frigate/video/ffmpeg.py
+index 67c0ac0..efad46f 100644
+--- a/frigate/video/ffmpeg.py
++++ b/frigate/video/ffmpeg.py
+@@ -1,16 +1,20 @@
+ """Manages ffmpeg processes for camera frame capture."""
+ 
+ import logging
++import os
+ import queue
+ import subprocess as sp
+ import threading
+ import time
++import uuid
+ from collections import deque
+ from datetime import UTC, datetime, timedelta
+ from multiprocessing import Queue, Value
+ from multiprocessing.synchronize import Event as MpEvent
+ from typing import Any
+ 
++import psutil
++
+ from frigate.camera import CameraMetrics
+ from frigate.comms.inter_process import InterProcessRequestor
+ from frigate.comms.recordings_updater import (
+@@ -23,6 +27,10 @@ from frigate.config.camera.updater import (
+     CameraConfigUpdateEnum,
+     CameraConfigUpdateSubscriber,
+ )
++from frigate.comms.recording_control_protocol import (
++    validate_writer_exit_receipts,
++    writer_set_digest,
++)
+ from frigate.const import PROCESS_PRIORITY_HIGH
+ from frigate.log import LogPipe
+ from frigate.util.builtin import EventsPerSecond, get_record_segment_time
+@@ -132,6 +140,8 @@ class CameraWatchdog(threading.Thread):
+         self.shm_frame_count = shm_frame_count
+         self.capture_thread = None
+         self.ffmpeg_detect_process = None
++        self.ffmpeg_detect_roles: list[str] = []
++        self.ffmpeg_detect_identity: dict[str, Any] | None = None
+         self.logpipe = LogPipe(f"ffmpeg.{self.config.name}.detect")
+         self.ffmpeg_other_processes: list[dict[str, Any]] = []
+         self.camera_fps = camera_fps
+@@ -161,6 +171,8 @@ class CameraWatchdog(threading.Thread):
+         self.requestor = InterProcessRequestor()
+         self.was_enabled = self.config.enabled
+         self.was_record_enabled_in_config = self.config.record.enabled_in_config
++        self.was_record_enabled = self.config.record.enabled
++        self.worker_instance = uuid.uuid4().hex
+ 
+         self.segment_subscriber = RecordingsDataSubscriber(RecordingsDataTypeEnum.all)
+         self.latest_valid_segment_time: float = 0
+@@ -168,6 +180,9 @@ class CameraWatchdog(threading.Thread):
+         self.latest_cache_segment_time: float = 0
+         self.record_enable_time: datetime | None = None
+         self.record_grace_until: datetime | None = None
++        self.pending_recording_control_updates: list[
++            tuple[str, str, float, list[dict[str, Any]], str]
++        ] = []
+ 
+         # `valid` segments are published with the segment's start time, so the
+         # gap between consecutive publishes can reach 2 * segment_time. Pad the
+@@ -219,6 +234,217 @@ class CameraWatchdog(threading.Thread):
+         """Check for config updates and return the update dict."""
+         return self.config_subscriber.check_for_updates()
+ 
++    @staticmethod
++    def _process_identity(process: sp.Popen, roles: Any) -> dict[str, Any] | None:
++        try:
++            created = psutil.Process(process.pid).create_time()
++        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
++            return None
++        normalized_roles = sorted(role.value if hasattr(role, "value") else str(role) for role in roles)
++        return {"pid": process.pid, "created": created, "roles": normalized_roles}
++
++    def _tracked_ffmpeg_processes(self) -> list[tuple[sp.Popen | None, list[str], dict[str, Any] | None]]:
++        tracked: list[tuple[sp.Popen | None, list[str], dict[str, Any] | None]] = [
++            (
++                self.ffmpeg_detect_process,
++                list(self.ffmpeg_detect_roles),
++                self.ffmpeg_detect_identity,
++            )
++        ]
++        tracked.extend(
++            (
++                item.get("process"),
++                list(item.get("roles", [])),
++                item.get("identity"),
++            )
++            for item in self.ffmpeg_other_processes
++        )
++        return tracked
++
++    def _record_output_inventory(self) -> tuple[list[dict[str, Any]], bool, int]:
++        """Snapshot every tracked record writer and verify config/process parity."""
++        expected_count = sum(
++            1 for command in self.config.ffmpeg_cmds if "record" in command["roles"]
++        )
++        should_run = bool(self.config.enabled and self.config.record.enabled)
++        expected_live_count = expected_count if should_run else 0
++        writers: list[dict[str, Any]] = []
++        complete = True
++        for process, roles, identity in self._tracked_ffmpeg_processes():
++            if "record" not in roles:
++                continue
++            if process is None or identity is None:
++                complete = False
++                continue
++            if process.poll() is None:
++                writers.append(dict(identity))
++        if len(writers) != expected_live_count:
++            complete = False
++        if writer_set_digest(writers) is None:
++            complete = False
++        return writers, complete, expected_count
++
++    def _worker_identity(self) -> dict[str, int | float] | None:
++        try:
++            process = psutil.Process(os.getpid())
++            return {"pid": process.pid, "created": process.create_time()}
++        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
++            return None
++
++    def _announce_recording_worker(self) -> None:
++        writers, inventory_complete, configured_count = self._record_output_inventory()
++        worker_identity = self._worker_identity()
++        if worker_identity is None:
++            return
++        self.requestor.send_data(
++            "recording_control/worker_ready",
++            {
++                "worker": "camera_capture",
++                "camera": self.config.name,
++                "worker_instance": self.worker_instance,
++                "worker_identity": worker_identity,
++                "inventory_complete": inventory_complete,
++                "record_enabled": bool(self.config.record.enabled),
++                "camera_enabled": bool(self.config.enabled),
++                "configured_record_output_count": configured_count,
++                "record_processes": writers,
++                "writer_set_digest": writer_set_digest(writers),
++            },
++        )
++
++    def _notify_recording_worker_invalidated(self, reason: str) -> None:
++        worker_identity = self._worker_identity()
++        if worker_identity is None:
++            return
++        self.requestor.send_data(
++            "recording_control/worker_invalidated",
++            {
++                "worker": "camera_capture",
++                "camera": self.config.name,
++                "worker_instance": self.worker_instance,
++                "worker_identity": worker_identity,
++                "reason": reason,
++            },
++        )
++
++    def _ack_recording_control(
++        self,
++        request_id: str,
++        generation: str,
++        enabled: bool,
++        *,
++        recording_segment: dict[str, Any] | None = None,
++    ) -> None:
++        """Report applied role state with process identities over local IPC."""
++        worker_identity = self._worker_identity()
++        if worker_identity is None:
++            return
++        record_processes, inventory_complete, configured_count = (
++            self._record_output_inventory()
++        )
++        if not enabled or not inventory_complete or not record_processes:
++            return
++        self.requestor.send_data(
++            "recording_control/ack",
++            {
++                "operation_id": request_id,
++                "camera": self.config.name,
++                "worker": "camera_capture",
++                "worker_instance": self.worker_instance,
++                "worker_identity": worker_identity,
++                "generation": generation,
++                "phase": "enabled",
++                "record_processes": record_processes,
++                "writer_set_digest": writer_set_digest(record_processes),
++                "inventory_complete": inventory_complete,
++                "configured_record_output_count": configured_count,
++                "enabled": enabled,
++                "applied": True,
++                "recording_segment": recording_segment,
++            },
++        )
++
++    def _queue_recording_control_ack(
++        self,
++        request_id: str,
++        generation: str,
++        enabled: bool,
++        expected_writers: list[dict[str, Any]],
++        expected_digest: str,
++        *,
++        writer_exit_receipts: list[dict[str, Any]] | None = None,
++        inventory_complete: bool = False,
++    ) -> None:
++        """Wait for a new segment on ON; prove exact exited writers on OFF."""
++        if enabled:
++            self.pending_recording_control_updates = [
++                (request_id, generation, time.time(), expected_writers, expected_digest)
++            ]
++        else:
++            self.pending_recording_control_updates.clear()
++            exits = writer_exit_receipts or []
++            proven = validate_writer_exit_receipts(
++                expected_writers,
++                expected_digest,
++                exits,
++                inventory_complete=inventory_complete,
++            ) and all(
++                receipt.get("exit_observed") is True
++                and isinstance(receipt.get("exit_code"), int)
++                for receipt in exits
++            )
++            worker_identity = self._worker_identity()
++            if worker_identity is None:
++                return
++            self.requestor.send_data(
++                "recording_control/ack",
++                {
++                    "operation_id": request_id,
++                    "camera": self.config.name,
++                    "worker": "camera_capture",
++                    "worker_instance": self.worker_instance,
++                    "worker_identity": worker_identity,
++                    "generation": generation,
++                    "phase": "writers_stopped",
++                    "record_processes": [],
++                    "writer_exit_receipts": exits,
++                    "writer_set_digest": expected_digest,
++                    "inventory_complete": bool(inventory_complete and proven),
++                    "enabled": False,
++                    "applied": True,
++                    "recording_segment": None,
++                },
++            )
++
++    def _ack_valid_recording_segment(self, camera: str, segment_time: Any) -> None:
++        """Acknowledge ON only for a validated segment produced after its request."""
++        if camera != self.config.name or not isinstance(segment_time, (int, float)):
++            return
++        eligible = [
++            (request_id, generation, requested_at)
++            for request_id, generation, requested_at, _, _
++            in self.pending_recording_control_updates
++            if segment_time >= requested_at
++        ]
++        if not eligible:
++            return
++        request_id, generation, requested_at = eligible[-1]
++        self._ack_recording_control(
++            request_id,
++            generation,
++            True,
++            recording_segment={
++                "camera": camera,
++                "start_time": float(segment_time),
++                "requested_at": requested_at,
++            },
++        )
++        self.pending_recording_control_updates = [
++            item
++            for item in self.pending_recording_control_updates
++            if item[0] != request_id
++        ]
++
+     def _update_enabled_state(self) -> bool:
+         """Fetch the latest config and update enabled state."""
+         self._check_config_updates()
+@@ -227,6 +453,8 @@ class CameraWatchdog(threading.Thread):
+     def reset_capture_thread(
+         self, terminate: bool = True, drain_output: bool = True
+     ) -> None:
++        if "record" in self.ffmpeg_detect_roles:
++            self._notify_recording_worker_invalidated("record_capture_process_restarted")
+         if terminate:
+             self.ffmpeg_detect_process.terminate()
+             try:
+@@ -269,6 +497,7 @@ class CameraWatchdog(threading.Thread):
+         self.logpipe.dump()
+         self.logger.info("Restarting ffmpeg...")
+         self.start_ffmpeg_detect()
++        self._announce_recording_worker()
+ 
+     def run(self) -> None:
+         if self._update_enabled_state():
+@@ -276,6 +505,7 @@ class CameraWatchdog(threading.Thread):
+             # If recording is enabled at startup, set the grace period timer
+             if self.config.record.enabled:
+                 self.record_enable_time = datetime.now().astimezone(UTC)
++        self._announce_recording_worker()
+ 
+         time.sleep(self.sleeptime)
+         last_restart_time = datetime.now().timestamp()
+@@ -283,6 +513,15 @@ class CameraWatchdog(threading.Thread):
+         # 1 second watchdog loop
+         while not self.stop_event.wait(1):
+             updates = self._check_config_updates()
++            invalidations = (
++                self.config_subscriber.drain_recording_control_invalidations()
++            )
++            for camera, reason in invalidations:
++                if camera == self.config.name:
++                    self._notify_recording_worker_invalidated(
++                        f"uncorrelated_config_update:{reason}"
++                    )
++            control_updates = self.config_subscriber.drain_recording_control_updates()
+ 
+             # Handle ffmpeg config changes by restarting all ffmpeg processes
+             if "ffmpeg" in updates and self.config.enabled:
+@@ -298,6 +537,7 @@ class CameraWatchdog(threading.Thread):
+                 self.record_grace_until = None
+                 self.record_enable_time = datetime.now().astimezone(UTC)
+                 last_restart_time = datetime.now().timestamp()
++                self._announce_recording_worker()
+                 continue
+ 
+             enabled = self.config.enabled
+@@ -322,25 +562,75 @@ class CameraWatchdog(threading.Thread):
+                     self._send_detect_status("disabled", now)
+                     self._send_record_status("disabled", now)
+                 self.was_enabled = enabled
++                self._announce_recording_worker()
+                 continue
+ 
+             record_enabled_in_config = self.config.record.enabled_in_config
+-            if record_enabled_in_config != self.was_record_enabled_in_config:
+-                if record_enabled_in_config and enabled:
+-                    self.logger.debug(
+-                        f"Record enabled in config for {self.config.name}, restarting ffmpeg"
+-                    )
+-                    self.stop_all_ffmpeg()
++            record_enabled = self.config.record.enabled
++            if (
++                record_enabled_in_config != self.was_record_enabled_in_config
++                or record_enabled != self.was_record_enabled
++            ):
++                self.logger.debug(
++                    "Recording config changed for %s, restarting ffmpeg",
++                    self.config.name,
++                )
++                stop_result = self.stop_all_ffmpeg()
++                if enabled:
+                     self.start_all_ffmpeg()
+-                    self.latest_valid_segment_time = 0
+-                    self.latest_invalid_segment_time = 0
+-                    self.latest_cache_segment_time = 0
+-                    self.record_grace_until = None
+-                    self.record_enable_time = datetime.now().astimezone(UTC)
+-                    last_restart_time = datetime.now().timestamp()
++                self.latest_valid_segment_time = 0
++                self.latest_invalid_segment_time = 0
++                self.latest_cache_segment_time = 0
++                self.record_grace_until = None
++                self.record_enable_time = (
++                    datetime.now().astimezone(UTC) if record_enabled else None
++                )
+                 self.was_record_enabled_in_config = record_enabled_in_config
++                self.was_record_enabled = record_enabled
++                last_restart_time = datetime.now().timestamp()
++                if control_updates:
++                    (
++                        camera,
++                        request_id,
++                        generation,
++                        target_enabled,
++                        expected_writers,
++                        expected_digest,
++                    ) = control_updates[-1]
++                    if camera == self.config.name and target_enabled == record_enabled:
++                        self._queue_recording_control_ack(
++                            request_id,
++                            generation,
++                            target_enabled,
++                            expected_writers,
++                            expected_digest,
++                            writer_exit_receipts=stop_result["writer_exit_receipts"],
++                            inventory_complete=stop_result["inventory_complete"],
++                        )
++                elif invalidations:
++                    self._announce_recording_worker()
+                 continue
+ 
++            if control_updates:
++                (
++                    camera,
++                    request_id,
++                    generation,
++                    target_enabled,
++                    expected_writers,
++                    expected_digest,
++                ) = control_updates[-1]
++                if camera == self.config.name and target_enabled == record_enabled:
++                    self._queue_recording_control_ack(
++                        request_id,
++                        generation,
++                        target_enabled,
++                        expected_writers,
++                        expected_digest,
++                        writer_exit_receipts=[],
++                        inventory_complete=not target_enabled,
++                    )
++
+             if not enabled:
+                 continue
+ 
+@@ -368,6 +658,7 @@ class CameraWatchdog(threading.Thread):
+                             f"Latest valid recording segment time on {camera}: {segment_time}"
+                         )
+                         self.latest_valid_segment_time = segment_time
++                        self._ack_valid_recording_segment(camera, segment_time)
+                     elif topic.endswith(RecordingsDataTypeEnum.latest.value):
+                         if segment_time is not None:
+                             self.latest_cache_segment_time = segment_time
+@@ -483,12 +774,21 @@ class CameraWatchdog(threading.Thread):
+                         self.logger.error(
+                             f"{reason} for {self.config.name} in the last {self.record_stale_threshold}s. Restarting the ffmpeg record process..."
+                         )
++                        if "record" in p["roles"]:
++                            self._notify_recording_worker_invalidated(
++                                "record_writer_stale_restart"
++                            )
+                         p["process"] = start_or_restart_ffmpeg(
+                             p["cmd"],
+                             self.logger,
+                             p["logpipe"],
+                             ffmpeg_process=p["process"],
+                         )
++                        p["identity"] = self._process_identity(
++                            p["process"], p["roles"]
++                        )
++                        if "record" in p["roles"]:
++                            self._announce_recording_worker()
+ 
+                         self._send_roles_offline(p["roles"], now)
+ 
+@@ -509,9 +809,16 @@ class CameraWatchdog(threading.Thread):
+                 self._send_roles_offline(p["roles"], now)
+ 
+                 p["logpipe"].dump()
++                if "record" in p["roles"]:
++                    self._notify_recording_worker_invalidated(
++                        "record_writer_exited_unexpectedly"
++                    )
+                 p["process"] = start_or_restart_ffmpeg(
+                     p["cmd"], self.logger, p["logpipe"], ffmpeg_process=p["process"]
+                 )
++                p["identity"] = self._process_identity(p["process"], p["roles"])
++                if "record" in p["roles"]:
++                    self._announce_recording_worker()
+ 
+             # Prune expired reconnect timestamps
+             now = datetime.now().timestamp()
+@@ -555,12 +862,20 @@ class CameraWatchdog(threading.Thread):
+         self.segment_subscriber.stop()
+ 
+     def start_ffmpeg_detect(self):
+-        ffmpeg_cmd = [
+-            c["cmd"] for c in self.config.ffmpeg_cmds if "detect" in c["roles"]
++        command = [
++            c for c in self.config.ffmpeg_cmds if "detect" in c["roles"]
+         ][0]
++        ffmpeg_cmd = command["cmd"]
+         self.ffmpeg_detect_process = start_or_restart_ffmpeg(
+             ffmpeg_cmd, self.logger, self.logpipe, self.frame_size
+         )
++        self.ffmpeg_detect_roles = [
++            role.value if hasattr(role, "value") else str(role)
++            for role in command["roles"]
++        ]
++        self.ffmpeg_detect_identity = self._process_identity(
++            self.ffmpeg_detect_process, self.ffmpeg_detect_roles
++        )
+         self.ffmpeg_pid.value = self.ffmpeg_detect_process.pid
+         self.capture_thread = CameraCaptureRunner(
+             self.config,
+@@ -591,26 +906,69 @@ class CameraWatchdog(threading.Thread):
+                     "roles": c["roles"],
+                     "logpipe": logpipe,
+                     "process": start_or_restart_ffmpeg(c["cmd"], self.logger, logpipe),
++                    "identity": None,
+                 }
+             )
++            self.ffmpeg_other_processes[-1]["identity"] = self._process_identity(
++                self.ffmpeg_other_processes[-1]["process"], c["roles"]
++            )
+ 
+     def stop_all_ffmpeg(self):
+-        """Stop all ffmpeg processes (detection and others)."""
++        """Stop FFmpeg processes and return identity-bound recording exits."""
+         logger.debug(f"Stopping all ffmpeg processes for {self.config.name}")
++        writer_exit_receipts: list[dict[str, Any]] = []
++        inventory_complete = True
+         if self.capture_thread is not None and self.capture_thread.is_alive():
+             self.capture_thread.join(timeout=5)
+             if self.capture_thread.is_alive():
++                inventory_complete = False
+                 self.logger.warning(
+                     f"Capture thread for {self.config.name} did not stop gracefully."
+                 )
+         if self.ffmpeg_detect_process is not None:
+-            stop_ffmpeg(self.ffmpeg_detect_process, self.logger)
++            process = self.ffmpeg_detect_process
++            roles = list(self.ffmpeg_detect_roles)
++            identity = self.ffmpeg_detect_identity
++            if "record" in roles and identity is None:
++                inventory_complete = False
++            if process.poll() is None:
++                stop_ffmpeg(process, self.logger)
++            if "record" in roles:
++                exit_code = process.poll()
++                if exit_code is None:
++                    inventory_complete = False
++                elif identity is not None:
++                    writer_exit_receipts.append(
++                        {**identity, "exit_observed": True, "exit_code": exit_code}
++                    )
+             self.ffmpeg_detect_process = None
++            self.ffmpeg_detect_roles = []
++            self.ffmpeg_detect_identity = None
+         for p in self.ffmpeg_other_processes[:]:
+-            if p["process"] is not None:
+-                stop_ffmpeg(p["process"], self.logger)
++            process = p["process"]
++            roles = [
++                role.value if hasattr(role, "value") else str(role)
++                for role in p["roles"]
++            ]
++            identity = p.get("identity")
++            if "record" in roles and identity is None:
++                inventory_complete = False
++            if process is not None and process.poll() is None:
++                stop_ffmpeg(process, self.logger)
++            if "record" in roles and process is not None:
++                exit_code = process.poll()
++                if exit_code is None:
++                    inventory_complete = False
++                elif identity is not None:
++                    writer_exit_receipts.append(
++                        {**identity, "exit_observed": True, "exit_code": exit_code}
++                    )
+             p["logpipe"].close()
+         self.ffmpeg_other_processes.clear()
++        return {
++            "writer_exit_receipts": writer_exit_receipts,
++            "inventory_complete": inventory_complete,
++        }
+ 
+ 
+ class CameraCaptureRunner(threading.Thread):
