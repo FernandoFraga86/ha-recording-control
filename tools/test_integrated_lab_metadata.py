@@ -16,6 +16,7 @@ from tools.integrated_service_lab import (
     wait_frigate_api,
 )
 from tools.integrated_lab.frigate_version import parse_frigate_version
+from tools.integrated_lab.synthetic_entity import select_synthetic_sensor_state
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,17 @@ class IntegratedLabMetadataTests(unittest.TestCase):
         for body in ('{"version":"0.18.2"}', "0.19.0", "not ready"):
             with self.subTest(body=body), self.assertRaises(ValueError):
                 parse_frigate_version(body)
+
+    def test_synthetic_entity_match_accepts_ha_device_prefix_but_rejects_ambiguity(self) -> None:
+        run_id = "42427283360a1"
+        state = {
+            "entity_id": "sensor.synthetic_frigate_ci_publisher_ci_frigate_mqtt_probe_" + run_id,
+            "state": "synthetic_event_received",
+            "attributes": {"friendly_name": "Synthetic Frigate CI Publisher CI Frigate MQTT Probe"},
+        }
+        self.assertEqual(select_synthetic_sensor_state([state], run_id), "synthetic_event_received")
+        self.assertIsNone(select_synthetic_sensor_state([state, state.copy()], run_id))
+        self.assertIsNone(select_synthetic_sensor_state([], run_id))
 
     @patch("tools.integrated_service_lab.require_running")
     @patch("tools.integrated_service_lab.docker_result")

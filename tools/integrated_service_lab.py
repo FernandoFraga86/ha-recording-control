@@ -15,8 +15,10 @@ from typing import Any
 
 try:
     from tools.integrated_lab.frigate_version import parse_frigate_version
+    from tools.integrated_lab.synthetic_entity import select_synthetic_sensor_state
 except ModuleNotFoundError:  # Script entry point places tools/ rather than the repo root on sys.path.
     from integrated_lab.frigate_version import parse_frigate_version
+    from integrated_lab.synthetic_entity import select_synthetic_sensor_state
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -139,10 +141,12 @@ def write_lab_configs(root: Path, run_id: str) -> tuple[Path, Path, Path]:
     )
     helper = ROOT / "tools" / "integrated_lab" / "ha_mqtt_smoke.py"
     version_helper = ROOT / "tools" / "integrated_lab" / "frigate_version.py"
-    if not helper.is_file() or not version_helper.is_file():
+    entity_helper = ROOT / "tools" / "integrated_lab" / "synthetic_entity.py"
+    if not helper.is_file() or not version_helper.is_file() or not entity_helper.is_file():
         raise RuntimeError("Home Assistant lab helper is missing")
     (control_dir / "ha_mqtt_smoke.py").write_bytes(helper.read_bytes())
     (control_dir / "frigate_version.py").write_bytes(version_helper.read_bytes())
+    (control_dir / "synthetic_entity.py").write_bytes(entity_helper.read_bytes())
     return broker_dir, ha_dir, frigate_dir
 
 

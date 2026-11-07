@@ -11,6 +11,7 @@ import time
 
 import aiohttp
 from frigate_version import parse_frigate_version
+from synthetic_entity import select_synthetic_sensor_state
 
 
 BASE = "http://127.0.0.1:8123"
@@ -227,12 +228,7 @@ async def main(run_id: str) -> None:
                         and friendly_name.startswith("CI Frigate MQTT Probe ")
                     ):
                         matches.append((str(current_entity_id), str(state.get("state"))))
-                    if state.get("entity_id") == entity_id or (
-                        isinstance(attrs, dict)
-                        and attrs.get("friendly_name") == "CI Frigate MQTT Probe " + run_id
-                    ):
-                        observed = str(state.get("state"))
-                        break
+                observed = select_synthetic_sensor_state(states, run_id)
                 CURRENT_DIAGNOSTIC = (
                     f"http_status={status}; states_count={len(states)}; "
                     f"target_entity={entity_id}; matching_synthetic_entities={matches[:5]!r}"
