@@ -1,6 +1,6 @@
 {
-  "schema": 1,
-  "artifact_kind": "source-patch-only",
+  "schema": 2,
+  "artifact_kind": "source-patch-and-experimental-build-workflow",
   "upstream_repository": "https://github.com/blakeblackshear/frigate",
   "upstream_release": "0.18.2",
   "upstream_base_commit": "cfa08c56b23d23280c3d0a218e5a43182c97445b",
@@ -8,12 +8,31 @@
   "overlay_sha256": "acc70d496dc667a2b44241b4bf527d6d8e8fe08a2e47d32ff4667598d45ff6be",
   "patch_path": "patches/recording-control-0.18.2.patch",
   "patch_sha256": "512f404a274aeb11a3e26246cddae48a62539cc01ccb10d6a297c5ea42221b65",
-  "candidate_version": "0.18.2-recording-control-1ca90f8",
+  "branding_variant": {
+    "patch_path": "patches/distribution-branding-rebrand1.patch",
+    "patch_sha256": "2df652c30405562f1884dbb4dc0982395e20b61285952b62b543487210bd855d",
+    "identity": "HA Recording Control",
+    "candidate_version": "0.18.2-recording-control-1ca90f8-rebrand1",
+    "removed_visual_assets_count": 12,
+    "licenses_and_attribution_retained": true
+  },
+  "candidate_version": "0.18.2-recording-control-1ca90f8-rebrand1",
+  "image": {
+    "repository": "ghcr.io/fernandofraga86/ha-recording-control",
+    "tag": "0.18.2-recording-control-1ca90f8-rebrand1",
+    "platform": "linux/amd64",
+    "intended_visibility": "public",
+    "published": false,
+    "oci_digest": null,
+    "production_ready": false,
+    "installable": false,
+    "native_recovery_enabled": false
+  },
   "publication_sanitization": {
     "scope": "single synthetic test-fixture username",
     "change": "replaced with a neutral synthetic viewer alias",
     "runtime_source_changed": false,
     "original_unsanitized_patch_sha256": "b85a726da23d8253791d3be00bf86824ae2e6c14daa4ab281daddef3abbdb88c"
   },
-  "test_claim": "No test result is asserted as bound to the exact hashes in this public source-only snapshot."
+  "test_claim": "The exact source reconstruction and UI/runtime checks are enforced by the manual GitHub Actions workflow; no result is claimed until that workflow completes."
 }

@@ -1,6 +1,6 @@
 # TEMPLATE ONLY. Do not rename to config.yaml or install.
-name: Recording Control for Frigate (Experimental)
-version: "0.18.2-recording-control-1ca90f8"
+name: HA Recording Control (Experimental)
+version: "0.18.2-recording-control-1ca90f8-rebrand1"
 breaking_versions:
   - "0.18.0"
   - "0.17.0"
@@ -10,7 +10,7 @@ breaking_versions:
 panel_icon: "mdi:cctv"
 panel_title: Recording Control
 slug: recording_control
-description: Unofficial experimental recording-control integration; not validated for installation.
+description: Experimental recording-control integration; not validated for installation.
 url: "https://github.com/FernandoFraga86/ha-recording-control"
 stage: experimental
 image: "ghcr.io/fernandofraga86/ha-recording-control"

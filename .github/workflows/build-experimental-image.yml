@@ -1,0 +1,200 @@
+name: Build experimental HA Recording Control image
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ha-recording-control-rebrand1-image
+  cancel-in-progress: false
+
+jobs:
+  build-verify-publish:
+    if: github.repository == 'FernandoFraga86/ha-recording-control' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/fernandofraga86/ha-recording-control
+      IMAGE_TAG: 0.18.2-recording-control-1ca90f8-rebrand1
+      DIST_REPOSITORY: https://github.com/FernandoFraga86/ha-recording-control
+
+    steps:
+      - name: Checkout distribution repository at the workflow commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: distribution
+          persist-credentials: false
+
+      - name: Checkout the pinned upstream source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: blakeblackshear/frigate
+          ref: cfa08c56b23d23280c3d0a218e5a43182c97445b
+          path: upstream
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check runner capacity without cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          available_bytes="$(df --output=avail -B1 / | tail -n 1 | tr -d ' ')"
+          required_bytes="$((12 * 1024 * 1024 * 1024))"
+          printf 'Runner filesystem free bytes: %s\n' "$available_bytes"
+          if (( available_bytes < required_bytes )); then
+            echo "Insufficient runner disk: require at least 12 GiB free; no cleanup or paid runner will be attempted." >&2
+            exit 1
+          fi
+          docker buildx version
+          python3 --version
+          node --version
+          npm --version
+
+      - name: Test the source and image verification gates
+        run: python3 -m unittest discover -s distribution/tools -p 'test_*.py' -v
+
+      - name: Reconstruct and verify the exact source candidate
+        run: >-
+          python3 distribution/tools/prepare_and_verify.py prepare
+          --upstream upstream
+          --distribution distribution
+          --expected-distribution-commit "${{ github.sha }}"
+
+      - name: Install locked web dependencies
+        working-directory: upstream/web
+        env:
+          CI: "1"
+          npm_config_audit: "false"
+          npm_config_fund: "false"
+        run: npm ci
+
+      - name: Run web unit tests and production build
+        working-directory: upstream/web
+        env:
+          CI: "1"
+        run: |
+          npm test -- --run --maxWorkers=2 --minWorkers=1
+          npm run build
+
+      - name: Verify compiled UI assets
+        run: >-
+          python3 distribution/tools/prepare_and_verify.py verify-built-web
+          --built-web upstream/web/dist
+          --distribution distribution
+
+      - name: Build the linux/amd64 image locally on the free runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --pull \
+            --platform linux/amd64 \
+            --target frigate \
+            --load \
+            --tag "$IMAGE:$IMAGE_TAG" \
+            --label "org.opencontainers.image.title=HA Recording Control" \
+            --label "org.opencontainers.image.version=$IMAGE_TAG" \
+            --label "org.opencontainers.image.source=$DIST_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.description=Experimental HA Recording Control distribution based on Frigate 0.18.2" \
+            --label "io.ha-recording-control.source-overlay-sha256=512f404a274aeb11a3e26246cddae48a62539cc01ccb10d6a297c5ea42221b65" \
+            --label "io.ha-recording-control.branding-patch-sha256=2df652c30405562f1884dbb4dc0982395e20b61285952b62b543487210bd855d" \
+            --file docker/main/Dockerfile \
+            upstream
+
+      - name: Verify image architecture, metadata, runtime syntax, UI, and licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_arch="$(docker image inspect "$IMAGE:$IMAGE_TAG" --format '{{.Os}}/{{.Architecture}}')"
+          test "$image_arch" = "linux/amd64"
+          docker image inspect "$IMAGE:$IMAGE_TAG" --format '{{json .Config.Labels}}' > "$RUNNER_TEMP/image-labels.json"
+          python3 - "$RUNNER_TEMP/image-labels.json" "$GITHUB_SHA" "$IMAGE_TAG" <<'PY'
+          import json, sys
+          labels = json.load(open(sys.argv[1], encoding="utf-8"))
+          expected = {
+              "org.opencontainers.image.title": "HA Recording Control",
+              "org.opencontainers.image.version": sys.argv[3],
+              "org.opencontainers.image.source": "https://github.com/FernandoFraga86/ha-recording-control",
+              "org.opencontainers.image.revision": sys.argv[2],
+          }
+          for key, value in expected.items():
+              if labels.get(key) != value:
+                  raise SystemExit(f"image label mismatch: {key}")
+          PY
+          docker run --rm --network none --entrypoint python3 "$IMAGE:$IMAGE_TAG" -m py_compile \
+            frigate/api/defs/request/app_body.py \
+            frigate/api/record.py \
+            frigate/comms/dispatcher.py \
+            frigate/comms/recording_control_protocol.py \
+            frigate/comms/runtime_state.py \
+            frigate/config/camera/updater.py \
+            frigate/config/config.py \
+            frigate/record/maintainer.py \
+            frigate/video/ffmpeg.py
+          docker save "$IMAGE:$IMAGE_TAG" | python3 distribution/tools/prepare_and_verify.py verify-image-layers --distribution distribution
+          container_id="$(docker create "$IMAGE:$IMAGE_TAG")"
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$RUNNER_TEMP/image-check/web" "$RUNNER_TEMP/image-check/licenses"
+          docker cp "$container_id:/opt/frigate/web/." "$RUNNER_TEMP/image-check/web/"
+          docker cp "$container_id:/opt/frigate/licenses/." "$RUNNER_TEMP/image-check/licenses/"
+          test -s "$RUNNER_TEMP/image-check/licenses/UPSTREAM-MIT-LICENSE"
+          test -s "$RUNNER_TEMP/image-check/licenses/UPSTREAM-TRADEMARK-POLICY.md"
+          test -s "$RUNNER_TEMP/image-check/licenses/UPSTREAM-WEB-BRAND-ASSETS-LICENSE"
+          python3 distribution/tools/prepare_and_verify.py verify-built-web \
+            --built-web "$RUNNER_TEMP/image-check/web" \
+            --distribution distribution
+          echo "Image checks passed for linux/amd64. Image has not yet been published." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the unique experimental tag and verify public visibility
+        id: publish
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          set +x
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+          # Refuse to overwrite an existing tag. Only an explicit registry
+          # "manifest unknown/not found" response is treated as an unused tag.
+          if docker buildx imagetools inspect "$IMAGE:$IMAGE_TAG" > "$RUNNER_TEMP/existing-tag-check.txt" 2>&1; then
+            echo "The requested image tag already exists; refusing to overwrite it." >&2
+            exit 1
+          elif ! grep -Eiq 'manifest unknown|no such manifest|manifest.*not found|404 Not Found' "$RUNNER_TEMP/existing-tag-check.txt"; then
+            cat "$RUNNER_TEMP/existing-tag-check.txt" >&2
+            echo "Could not prove the requested tag is unused; stopping before push." >&2
+            exit 1
+          fi
+
+          docker push "$IMAGE:$IMAGE_TAG"
+          docker logout ghcr.io
+
+          # Anonymous manifest resolution is required; do not mark private images as public.
+          if ! docker buildx imagetools inspect "$IMAGE:$IMAGE_TAG" > "$RUNNER_TEMP/public-manifest.txt" 2>&1; then
+            cat "$RUNNER_TEMP/public-manifest.txt" >&2
+            echo "Image was pushed, but anonymous GHCR access was not verified. Stop; do not change visibility or install it automatically." >&2
+            exit 1
+          fi
+          digest="$(awk '/^Digest:/ {print $2; exit}' "$RUNNER_TEMP/public-manifest.txt")"
+          if [[ ! "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "Registry did not return a verifiable OCI digest." >&2
+            exit 1
+          fi
+          {
+            echo "### Experimental image published"
+            echo
+            echo "- Image: `$IMAGE:$IMAGE_TAG`"
+            echo "- Platform: `linux/amd64`"
+            echo "- OCI digest: `$digest`"
+            echo "- Anonymous GHCR manifest access: verified"
+            echo "- Workflow source commit: `$GITHUB_SHA`"
+            echo "- This does not authorize Supervisor installation or production use."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"

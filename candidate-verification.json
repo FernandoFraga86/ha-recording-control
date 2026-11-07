@@ -1,0 +1,92 @@
+{
+  "schema": 1,
+  "candidate_version": "0.18.2-recording-control-1ca90f8-rebrand1",
+  "upstream": {
+    "repository": "https://github.com/blakeblackshear/frigate",
+    "commit": "cfa08c56b23d23280c3d0a218e5a43182c97445b"
+  },
+  "distribution_repository": "FernandoFraga86/ha-recording-control",
+  "image_repository": "ghcr.io/fernandofraga86/ha-recording-control",
+  "image_platform": "linux/amd64",
+  "patches": {
+    "source_overlay": {
+      "path": "patches/recording-control-0.18.2.patch",
+      "sha256": "512f404a274aeb11a3e26246cddae48a62539cc01ccb10d6a297c5ea42221b65"
+    },
+    "distribution_branding": {
+      "path": "patches/distribution-branding-rebrand1.patch",
+      "sha256": "2df652c30405562f1884dbb4dc0982395e20b61285952b62b543487210bd855d"
+    }
+  },
+  "overlay_paths": [
+    "frigate/api/defs/request/app_body.py",
+    "frigate/api/record.py",
+    "frigate/comms/dispatcher.py",
+    "frigate/comms/recording_control_protocol.py",
+    "frigate/comms/runtime_state.py",
+    "frigate/config/camera/updater.py",
+    "frigate/config/config.py",
+    "frigate/record/maintainer.py",
+    "frigate/test/http_api/test_http_recording_control.py",
+    "frigate/test/test_config.py",
+    "frigate/test/test_dispatcher_runtime_state.py",
+    "frigate/test/test_recording_control_barrier_protocol.py",
+    "frigate/test/test_recording_control_workers.py",
+    "frigate/test/test_runtime_state.py",
+    "frigate/video/ffmpeg.py"
+  ],
+  "runtime_sha256_lf": {
+    "frigate/api/defs/request/app_body.py": "30602cefa04968fe3715619524dd59f96fcd2cb19fb46e81b8d5ce40e6ef92ef",
+    "frigate/api/record.py": "7c2e4c588d24e0dd74255508bdad030ec5a085ce1dcc757855d34ccd83e4e29a",
+    "frigate/comms/dispatcher.py": "5eac3b8e722482e7678e64de6afe1f3028e7a390499eb6e2a67e3198f2878b8a",
+    "frigate/comms/recording_control_protocol.py": "b21e4c804affbb4893d09576c9ff1f4a70dc8caad0c21cecc2c79facb5816908",
+    "frigate/comms/runtime_state.py": "33ea091b143ec96ba7c84b381a6765eab63bedd13a4149313c4674da6b19336e",
+    "frigate/config/camera/updater.py": "4da596b010cda62eacb40a2f8672d11ecbee7cbfcf9cdef50c848926c5cfbdfe",
+    "frigate/config/config.py": "60b722ade1a518e6c4b44f54dfac806595563bcc9161b8cd30e4ca8c250770ea",
+    "frigate/record/maintainer.py": "f81b32b76d6fedc8d1a05156163097aaca514ccba11243d9aad801d4e3ab463f",
+    "frigate/video/ffmpeg.py": "a4ca5165aa46843a58be42f1ca3b9d7f9924c2061a7d13b8c8bbb17c0e926361"
+  },
+  "branding_files_sha256_lf": {
+    "docker/main/Dockerfile": "3d6c88c15d51abeceb3bb9d684eacb5f40061f9b120dbf943b2863eeb58001d3",
+    "web/index.html": "bea6550c973568b712098c5ac31721b0b7c683aa0a934d678b39d3852c0f9bb9",
+    "web/login.html": "39ddeab69f71f4b203d7f3969616202f395aaa24108754b106ad830d51878a5a",
+    "web/site.webmanifest": "95a039440eb525615bbd3e107cd1ffadf3a73b6967488d5326464f4cae700946",
+    "web/src/components/Logo.tsx": "cd14fbe8c74e885ed4bc9e5b0970b9ba9c09481e2ebbb6a9903cd4d1a9e60b0e",
+    "web/public/notifications-worker.js": "2f1c7ac2d3d3f908a36c10bc732aaea15ab265b362119112049eb8059a8740fd",
+    "web/public/images/ha-recording-control.svg": "96233ae44e9f8200b9c1917c8db2cc90267336feadd1a0dedc4b278884af2090"
+  },
+  "removed_visual_assets": [
+    "web/images/branding/apple-touch-icon.png",
+    "web/images/branding/favicon-16x16.png",
+    "web/images/branding/favicon-32x32.png",
+    "web/images/branding/favicon.ico",
+    "web/images/branding/favicon.png",
+    "web/images/branding/favicon.svg",
+    "web/images/branding/mstile-150x150.png",
+    "web/public/images/android-chrome-192x192.png",
+    "web/public/images/android-chrome-512x512.png",
+    "web/public/images/apple-touch-icon.png",
+    "web/public/images/maskable-badge.png",
+    "web/public/images/maskable-icon.png"
+  ],
+  "upstream_brand_asset_sha256": {
+    "web/images/branding/apple-touch-icon.png": "f2f63a2a7813b2cc8263d1e1c98fa2940d7a83ff8821fd9a5c5f5ebf0017e8f1",
+    "web/images/branding/favicon-16x16.png": "95ada8dc95e0a77d3e9101b70342eba25f18f0b23806f40e8ee9fc3cd5bfc340",
+    "web/images/branding/favicon-32x32.png": "0bd05aff9896ffd35b98b43edfaa72cd0ea6d4df351aeeea8d275807c5c0d961",
+    "web/images/branding/favicon.ico": "92a9ac8bffdb4add22a03b83501d99355bd773d7f08be61145278fd48c06ca16",
+    "web/images/branding/favicon.png": "ff4c90ace5fa5a938d460f1d6934d006a706138ba8c049202501b353fe74f8f7",
+    "web/images/branding/favicon.svg": "1264f127d8a1a44a306aee34a76d58d61cf44a4646ebed8a1b100d079eed6b8d",
+    "web/images/branding/mstile-150x150.png": "f77b31fd349e6bcfb8dc52137bb3d8b6156bf925a309dd47015baf358168a8ef",
+    "web/public/images/android-chrome-192x192.png": "4201750135bace76b70b0c62079cd5e3e4f39c998de96b26fc98ccc40e3f3d70",
+    "web/public/images/android-chrome-512x512.png": "0a410a88068d446e902331ee5635fee820534fb5c021b85ccaab44d7d6e0c7a0",
+    "web/public/images/apple-touch-icon.png": "f2f63a2a7813b2cc8263d1e1c98fa2940d7a83ff8821fd9a5c5f5ebf0017e8f1",
+    "web/public/images/maskable-badge.png": "a927994d149b1d66abc9f9c484b44dcccd5ea1827de50612fe42dd524e808f05",
+    "web/public/images/maskable-icon.png": "e686a02ee4e7769fde7195d94f0e6f89d867588021f2049cdc762631043523c0"
+  },
+  "required_attribution_files": [
+    "LICENSE",
+    "TRADEMARK.md",
+    "web/images/branding/LICENSE"
+  ],
+  "ui_identity": "HA Recording Control"
+}

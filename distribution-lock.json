@@ -1,7 +1,8 @@
 {
-  "schema": 1,
+  "schema": 2,
   "status": "EXPERIMENTAL_SOURCE_ONLY_NOT_INSTALLABLE",
   "production_ready": false,
+  "native_recovery_enabled": false,
   "repository_url": "https://github.com/FernandoFraga86/ha-recording-control",
   "app": {
     "slug": "recording_control",
@@ -16,22 +17,29 @@
     "upstream_base_commit": "cfa08c56b23d23280c3d0a218e5a43182c97445b",
     "candidate_commit": "1ca90f845603cd30e1dd241fd9e3ce6506a36841",
     "overlay_sha256": "acc70d496dc667a2b44241b4bf527d6d8e8fe08a2e47d32ff4667598d45ff6be",
-    "patch_sha256": "512f404a274aeb11a3e26246cddae48a62539cc01ccb10d6a297c5ea42221b65"
+    "patch_sha256": "512f404a274aeb11a3e26246cddae48a62539cc01ccb10d6a297c5ea42221b65",
+    "branding_variant": "rebrand1",
+    "branding_patch_path": "patches/distribution-branding-rebrand1.patch",
+    "branding_patch_sha256": "2df652c30405562f1884dbb4dc0982395e20b61285952b62b543487210bd855d"
   },
   "image": {
     "visibility_intended": "public",
     "repository": "ghcr.io/fernandofraga86/ha-recording-control",
-    "version_tag": "0.18.2-recording-control-1ca90f8",
+    "version_tag": "0.18.2-recording-control-1ca90f8-rebrand1",
+    "platform": "linux/amd64",
     "published": false,
+    "installable": false,
     "registry_tag_immutability_verified": false,
     "oci_index_digest": null,
-    "platform_digest_amd64": null
+    "platform_digest_amd64": null,
+    "workflow_commit": null
   },
   "installable": false,
   "blocking_gates": [
-    "container image not published and OCI digest not verified",
+    "experimental image build and OCI digest verification pending",
+    "public anonymous registry read verification pending",
     "target Supervisor load/install validation pending",
     "startup recovery and privacy acceptance validation pending",
-    "branding review for any runnable derivative pending"
+    "full runnable-derivative branding and UI validation pending"
   ]
 }
