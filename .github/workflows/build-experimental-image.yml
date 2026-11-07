@@ -205,11 +205,12 @@ jobs:
           python3 distribution/tools/prepare_and_verify.py verify-built-web \
             --built-web "$RUNNER_TEMP/image-check/web" \
             --distribution distribution
-          python3 - "$RUNNER_TEMP/image-check/frigate" distribution/candidate-verification.json <<'PY'
-          import hashlib, json, sys
+          python3 - "$RUNNER_TEMP/image-check/frigate" distribution/candidate-verification.json "$RUNNER_TEMP/image-build-provenance.json" <<'PY'
+          import hashlib, json, re, sys
           from pathlib import Path
           root = Path(sys.argv[1])
           lock = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+          provenance = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
           verified = 0
           for upstream_path, expected in lock["runtime_sha256_lf"].items():
               relative = upstream_path.removeprefix("frigate/")
@@ -220,6 +221,16 @@ jobs:
           if verified != len(lock["runtime_sha256_lf"]):
               raise SystemExit("not all locked runtime files were verified")
           print(f"Exact candidate runtime source hashes verified in image: {verified}")
+          if provenance.get("upstream_generated_version_file_verified") is not True:
+              raise SystemExit("builder did not verify the generated pinned Frigate version.py")
+          expected = provenance.get("upstream_generated_version_file_repack_sha256")
+          version_file = root / "version.py"
+          if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None or not version_file.is_file():
+              raise SystemExit("verified generated Frigate version.py is missing or malformed")
+          actual = hashlib.sha256(version_file.read_bytes()).hexdigest()
+          if actual != expected:
+              raise SystemExit("generated Frigate version.py changed in the imported image")
+          print("Generated pinned Frigate version.py hash verified in the imported image")
           PY
           echo "Image checks passed for linux/amd64. Image has not yet been published." >> "$GITHUB_STEP_SUMMARY"
 

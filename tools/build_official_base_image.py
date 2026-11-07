@@ -327,6 +327,30 @@ def verify_python_tree_matches_commit(
     return len(expected), generated_version_verified
 
 
+def prepare_repacked_frigate_source(
+    upstream_frigate: Path,
+    image_frigate: Path,
+    destination: Path,
+    *,
+    generated_version_verified: bool,
+) -> Path:
+    if not generated_version_verified:
+        return upstream_frigate
+    upstream_version = upstream_frigate / "version.py"
+    image_version = image_frigate / "version.py"
+    if upstream_version.exists():
+        fail("refusing to overlay generated version.py onto a tracked upstream file")
+    if not image_version.is_file():
+        fail("verified generated version.py is missing from the official image source tree")
+    if destination.exists():
+        fail("repacked Frigate source staging path already exists")
+    shutil.copytree(upstream_frigate, destination, symlinks=True)
+    shutil.copy2(image_version, destination / "version.py")
+    if (destination / "version.py").read_bytes() != image_version.read_bytes():
+        fail("generated version.py changed while preparing the repacked Frigate source")
+    return destination
+
+
 def _inspect_image(reference: str) -> dict[str, Any]:
     data = json.loads(run(["docker", "image", "inspect", reference], capture=True))
     if len(data) != 1:
@@ -396,6 +420,7 @@ def build_image(args: argparse.Namespace) -> None:
     container_id = run(["docker", "create", "--platform=linux/amd64", "--name", container_name, platform_ref], capture=True).strip()
     archive_path = temp_root / f"ha-recording-control-rootfs-{uuid4().hex}.tar.gz"
     copied_source = temp_root / f"ha-recording-control-base-source-{uuid4().hex}"
+    source_overlay = temp_root / f"ha-recording-control-repacked-source-{uuid4().hex}"
     copied_source.mkdir()
     try:
         # Copy the image's unmodified Python tree before the filesystem export.
@@ -404,6 +429,15 @@ def build_image(args: argparse.Namespace) -> None:
             upstream,
             copied_source,
             upstream_commit,
+        )
+        frigate_source = prepare_repacked_frigate_source(
+            upstream / "frigate",
+            copied_source,
+            source_overlay,
+            generated_version_verified=generated_version_verified,
+        )
+        generated_version_sha256 = (
+            file_sha256(frigate_source / "version.py") if generated_version_verified else None
         )
 
         export_log = temp_root / "ha-recording-control-docker-export.stderr.log"
@@ -418,7 +452,7 @@ def build_image(args: argparse.Namespace) -> None:
                 repack_stats = repack_rootfs(
                     process.stdout,
                     archive_path,
-                    frigate_source=upstream / "frigate",
+                    frigate_source=frigate_source,
                     built_web=built_web,
                     attribution_root=upstream,
                     removed_visual_assets=verification["removed_visual_assets"],
@@ -477,6 +511,7 @@ def build_image(args: argparse.Namespace) -> None:
             "base_config_digest": expected_config,
             "upstream_python_source_files_verified": source_count,
             "upstream_generated_version_file_verified": generated_version_verified,
+            "upstream_generated_version_file_repack_sha256": generated_version_sha256,
             "rootfs_transformation": repack_stats,
             "rootfs_archive_bytes": archive_path.stat().st_size,
             "rootfs_archive_sha256": file_sha256(archive_path),
@@ -494,6 +529,7 @@ def build_image(args: argparse.Namespace) -> None:
         if archive_path.exists():
             archive_path.unlink()
         shutil.rmtree(copied_source, ignore_errors=True)
+        shutil.rmtree(source_overlay, ignore_errors=True)
 
 
 def main() -> None:

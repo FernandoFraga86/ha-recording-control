@@ -13,6 +13,7 @@ from build_official_base_image import (
     docker_import_changes,
     pinned_patch_labels,
     pinned_upstream_commit,
+    prepare_repacked_frigate_source,
     verify_oci_index,
     verify_oci_manifest,
     verify_python_tree_matches_commit,
@@ -231,6 +232,48 @@ class OfficialImageBuildTests(unittest.TestCase):
                 verify_python_tree_matches_commit(upstream, copied, pinned_commit)
             with self.assertRaises(SystemExit):
                 verify_python_tree_matches_commit(upstream, copied, "0" * 40)
+
+    def test_repacked_source_carries_only_the_verified_generated_version_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ha-version-overlay-") as temp_dir:
+            root = Path(temp_dir)
+            upstream_frigate = root / "upstream" / "frigate"
+            image_frigate = root / "image" / "frigate"
+            staged = root / "staged"
+            upstream_frigate.mkdir(parents=True)
+            image_frigate.mkdir(parents=True)
+            (upstream_frigate / "__init__.py").write_bytes(b"# tracked source\n")
+            generated = b'VERSION = "0.18.2-pinnedhash"\n'
+            (image_frigate / "version.py").write_bytes(generated)
+
+            result = prepare_repacked_frigate_source(
+                upstream_frigate,
+                image_frigate,
+                staged,
+                generated_version_verified=True,
+            )
+
+            self.assertEqual(result, staged)
+            self.assertEqual((staged / "version.py").read_bytes(), generated)
+            self.assertFalse((upstream_frigate / "version.py").exists())
+
+    def test_repacked_source_does_not_add_unverified_version_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ha-version-no-overlay-") as temp_dir:
+            root = Path(temp_dir)
+            upstream_frigate = root / "upstream" / "frigate"
+            image_frigate = root / "image" / "frigate"
+            staged = root / "staged"
+            upstream_frigate.mkdir(parents=True)
+            image_frigate.mkdir(parents=True)
+
+            result = prepare_repacked_frigate_source(
+                upstream_frigate,
+                image_frigate,
+                staged,
+                generated_version_verified=False,
+            )
+
+            self.assertEqual(result, upstream_frigate)
+            self.assertFalse(staged.exists())
 
 
 if __name__ == "__main__":
