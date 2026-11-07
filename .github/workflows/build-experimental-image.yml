@@ -146,7 +146,7 @@ jobs:
             --label "org.opencontainers.image.description=Experimental HA Recording Control distribution based on Frigate 0.18.2" \
             --label "io.ha-recording-control.source-overlay-sha256=512f404a274aeb11a3e26246cddae48a62539cc01ccb10d6a297c5ea42221b65" \
             --label "io.ha-recording-control.branding-patch-sha256=35dddbc08947abb8db1b97e7faeb4855d323f8f0fa722db9756afcf20a2e0a6a" \
-            --file docker/main/Dockerfile \
+            --file upstream/docker/main/Dockerfile \
             upstream
 
       - name: Verify image architecture, metadata, runtime syntax, UI, and licenses
