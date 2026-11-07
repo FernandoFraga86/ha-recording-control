@@ -446,8 +446,17 @@ def build_image(args: argparse.Namespace) -> None:
             fail("imported candidate image is not linux/amd64")
         if len((final_image.get("RootFS") or {}).get("Layers") or []) != 1:
             fail("flattened distribution must contain exactly one filesystem layer")
-        if _canonical_config(final_image.get("Config") or {}) != _canonical_config(base_config):
-            fail("imported image changed an operational Docker config field from the verified official base")
+        expected_runtime_config = _canonical_config(base_config)
+        actual_runtime_config = _canonical_config(final_image.get("Config") or {})
+        changed_runtime_fields = sorted(
+            key for key, expected_value in expected_runtime_config.items()
+            if actual_runtime_config.get(key) != expected_value
+        )
+        if changed_runtime_fields:
+            fail(
+                "imported image changed operational Docker config fields from the verified official base: "
+                + ", ".join(changed_runtime_fields)
+            )
         actual_labels = (final_image.get("Config") or {}).get("Labels") or {}
         expected_labels = dict(base_config.get("Labels") or {})
         expected_labels.update(labels)
