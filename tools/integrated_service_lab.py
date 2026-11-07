@@ -169,8 +169,42 @@ def remove_runner_temp_root(root: Path, root_base: Path) -> None:
 
 
 def inspect_container(name: str) -> dict[str, Any]:
-    result = docker("inspect", name, capture=True)
-    return json.loads(result)[0]
+    result = subprocess.run(
+        ["docker", "inspect", name],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"could not inspect lab container {name}: {(result.stdout or '')[-500:]}")
+    inspected = json.loads(result.stdout or "")
+    if not isinstance(inspected, list) or len(inspected) != 1:
+        raise RuntimeError(f"unexpected inspect result for lab container {name}")
+    return inspected[0]
+
+
+def inspect_optional(kind: str, name: str) -> dict[str, Any] | None:
+    if kind not in {"container", "network"}:
+        raise ValueError("unsupported lab resource kind")
+    result = subprocess.run(
+        ["docker", "inspect", name] if kind == "container" else ["docker", "network", "inspect", name],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+    )
+    output = result.stdout or ""
+    if result.returncode != 0:
+        if "No such container" in output or "No such object" in output or "No such network" in output:
+            return None
+        raise RuntimeError(f"could not inspect lab {kind} {name}: {output[-500:]}")
+    inspected = json.loads(output)
+    if not isinstance(inspected, list) or len(inspected) != 1:
+        raise RuntimeError(f"unexpected inspect result for lab {kind} {name}")
+    return inspected[0]
 
 
 def require_running(name: str) -> None:
@@ -291,10 +325,10 @@ except urllib.error.HTTPError as error:
 def stop_and_remove(names: list[str], network: str, *, require_clean: bool) -> list[str]:
     errors: list[str] = []
     for name in names:
-        inspected = docker("inspect", name, capture=True, check=False)
-        if not inspected:
+        inspected = inspect_optional("container", name)
+        if inspected is None:
             continue
-        state = json.loads(inspected)[0]["State"]
+        state = inspected["State"]
         if state.get("Running"):
             stop_started = time.monotonic()
             result = docker("stop", "--time", "30", name, capture=True, check=False)
@@ -303,15 +337,16 @@ def stop_and_remove(names: list[str], network: str, *, require_clean: bool) -> l
                 errors.append(f"could not stop {name} cleanly")
             if stop_elapsed >= 29:
                 errors.append(f"container {name} approached the forced-stop timeout")
-        inspected = docker("inspect", name, capture=True, check=False)
-        if inspected:
-            status = json.loads(inspected)[0]["State"]
+        inspected = inspect_optional("container", name)
+        if inspected is not None:
+            status = inspected["State"]
             if status.get("Running") or status.get("Status") != "exited" or status.get("OOMKilled"):
                 errors.append(f"container {name} did not reach exited state")
-            docker("rm", name, check=False)
+            docker("rm", "--force", name, check=False)
+        if inspect_optional("container", name) is not None:
+            errors.append(f"container {name} remained after cleanup")
     docker("network", "rm", network, check=False)
-    network_check = docker("network", "inspect", network, capture=True, check=False)
-    if network_check:
+    if inspect_optional("network", network) is not None:
         errors.append("temporary internal network remained after cleanup")
     if errors and require_clean:
         raise RuntimeError("clean shutdown/cleanup failed: " + "; ".join(errors))

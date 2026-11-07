@@ -14,6 +14,7 @@ import aiohttp
 
 BASE = "http://127.0.0.1:8123"
 STATUS = Path("/lab-control/ha-result.json")
+CURRENT_STEP = "startup"
 
 
 def write_status(phase: str, **fields: object) -> None:
@@ -43,8 +44,10 @@ async def request_json(
 
 
 async def main(run_id: str) -> None:
+    global CURRENT_STEP
     timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        CURRENT_STEP = "wait_for_core_onboarding"
         deadline = time.monotonic() + 240
         onboarding: object = None
         while time.monotonic() < deadline:
@@ -66,6 +69,7 @@ async def main(run_id: str) -> None:
         username = "ci_lab_" + secrets.token_hex(8)
         password = secrets.token_urlsafe(32)
         client_id = "http://localhost:8123/"
+        CURRENT_STEP = "create_disposable_onboarding_user"
         status, created = await request_json(
             session,
             "POST",
@@ -81,6 +85,7 @@ async def main(run_id: str) -> None:
         if status != 200 or not isinstance(created, dict) or not created.get("auth_code"):
             raise RuntimeError("disposable Core onboarding user creation failed")
 
+        CURRENT_STEP = "exchange_disposable_auth_code"
         status, token_result = await request_json(
             session,
             "POST",
@@ -95,10 +100,12 @@ async def main(run_id: str) -> None:
             raise RuntimeError("disposable Core API token exchange failed")
         token = str(token_result["access_token"])
 
+        CURRENT_STEP = "verify_authenticated_core_api"
         status, api_health = await request_json(session, "GET", BASE + "/api", token=token)
         if status != 200 or not isinstance(api_health, dict) or api_health.get("message") != "API running.":
             raise RuntimeError("authenticated Core REST API probe failed")
 
+        CURRENT_STEP = "open_real_mqtt_config_flow"
         status, flow = await request_json(
             session,
             "POST",
@@ -121,6 +128,7 @@ async def main(run_id: str) -> None:
                 "transport": "tcp",
             },
         }
+        CURRENT_STEP = "submit_real_mqtt_config_flow"
         status, configured = await request_json(
             session,
             "POST",
@@ -136,6 +144,7 @@ async def main(run_id: str) -> None:
                 f"result_type={result_type}; errors={errors}"
             )
 
+        CURRENT_STEP = "wait_for_loaded_mqtt_config_entry"
         entry_deadline = time.monotonic() + 45
         mqtt_entry_loaded = False
         while time.monotonic() < entry_deadline:
@@ -164,6 +173,7 @@ async def main(run_id: str) -> None:
             run_id=run_id,
         )
 
+        CURRENT_STEP = "verify_core_to_frigate_api"
         frigate_version: str | None = None
         api_deadline = time.monotonic() + 180
         while time.monotonic() < api_deadline:
@@ -181,6 +191,7 @@ async def main(run_id: str) -> None:
         if frigate_version is None:
             raise RuntimeError("Core could not reach the Frigate API over the isolated network")
 
+        CURRENT_STEP = "observe_synthetic_mqtt_entity_state"
         event_deadline = time.monotonic() + 90
         observed: str | None = None
         while time.monotonic() < event_deadline:
@@ -225,7 +236,7 @@ if __name__ == "__main__":
         try:
             write_status(
                 "failed",
-                step="ha_mqtt_integration_or_event",
+                step=CURRENT_STEP,
                 error_type=type(error).__name__,
             )
         except OSError:

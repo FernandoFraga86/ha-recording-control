@@ -7,8 +7,9 @@ from pathlib import Path
 import re
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from tools.integrated_service_lab import validate_runner_temp_root
+from tools.integrated_service_lab import inspect_optional, validate_runner_temp_root
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +27,19 @@ class IntegratedLabMetadataTests(unittest.TestCase):
                 validate_runner_temp_root(base, base)
             with self.assertRaises(RuntimeError):
                 validate_runner_temp_root(base / "unrelated", base)
+
+    @patch("tools.integrated_service_lab.subprocess.run")
+    def test_cleanup_inspection_treats_a_missing_container_as_absent(self, run) -> None:
+        run.return_value.returncode = 1
+        run.return_value.stdout = "Error response from daemon: No such container: lab-only"
+        self.assertIsNone(inspect_optional("container", "lab-only"))
+
+    @patch("tools.integrated_service_lab.subprocess.run")
+    def test_cleanup_inspection_fails_closed_on_unrecognized_inspect_error(self, run) -> None:
+        run.return_value.returncode = 1
+        run.return_value.stdout = "Docker daemon unavailable"
+        with self.assertRaises(RuntimeError):
+            inspect_optional("container", "lab-only")
 
     def test_published_artifact_metadata_is_synchronized_and_non_installable(self) -> None:
         lock = json.loads((ROOT / "distribution-lock.json").read_text(encoding="utf-8"))
