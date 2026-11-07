@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from build_official_base_image import (
+    _canonical_config,
     docker_import_changes,
     pinned_patch_labels,
     pinned_upstream_commit,
@@ -128,6 +129,19 @@ class OfficialImageBuildTests(unittest.TestCase):
         self.assertTrue(any(item.startswith("HEALTHCHECK --interval=15s") for item in instructions))
         self.assertIn('LABEL org.example.base="upstream"', instructions)
         self.assertIn('LABEL org.opencontainers.image.title="HA Recording Control"', instructions)
+
+    def test_runtime_config_comparison_normalizes_only_workdir_trailing_slash(self) -> None:
+        base = _canonical_config({"WorkingDir": "/opt/frigate/"})
+        imported = _canonical_config({"WorkingDir": "/opt/frigate"})
+        self.assertEqual(base, imported)
+        self.assertNotEqual(
+            _canonical_config({"WorkingDir": "/opt/frigate//"}),
+            imported,
+        )
+        self.assertNotEqual(
+            _canonical_config({"WorkingDir": "/opt/other/"}),
+            imported,
+        )
 
     def test_linux_import_omits_windows_only_args_escaped_but_preserves_commands(self) -> None:
         config = {"ArgsEscaped": True, "Entrypoint": ["/init"], "Cmd": ["python", "-m", "frigate"]}

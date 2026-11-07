@@ -231,11 +231,16 @@ def docker_import_changes(config: dict[str, Any], labels: dict[str, str], *, ima
 
 
 def _canonical_config(config: dict[str, Any]) -> dict[str, Any]:
+    working_dir = config.get("WorkingDir") or ""
+    if not isinstance(working_dir, str):
+        fail("image WorkingDir must be a string")
+    if working_dir.endswith("/") and working_dir != "/":
+        working_dir = working_dir[:-1]
     return {
         "Env": config.get("Env") or [],
         "Entrypoint": config.get("Entrypoint") or [],
         "Cmd": config.get("Cmd") or [],
-        "WorkingDir": config.get("WorkingDir") or "",
+        "WorkingDir": working_dir,
         "User": config.get("User") or "",
         "ExposedPorts": config.get("ExposedPorts") or {},
         "Volumes": config.get("Volumes") or {},
