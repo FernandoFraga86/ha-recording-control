@@ -1,7 +1,10 @@
 diff --git a/docker/main/build_nginx.sh b/docker/main/build_nginx.sh
 --- a/docker/main/build_nginx.sh
 +++ b/docker/main/build_nginx.sh
-@@ -33,4 +33,10 @@
+@@ -30,10 +30,16 @@
+ wget -nv https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz
+ tar -zxf nginx-${NGINX_VERSION}.tar.gz -C /tmp/nginx --strip-components=1
+ rm nginx-${NGINX_VERSION}.tar.gz
  mkdir /tmp/nginx-vod-module
 -wget -nv https://github.com/kaltura/nginx-vod-module/archive/refs/tags/${VOD_MODULE_VERSION}.tar.gz
 -tar -zxf ${VOD_MODULE_VERSION}.tar.gz -C /tmp/nginx-vod-module --strip-components=1
@@ -15,3 +18,6 @@ diff --git a/docker/main/build_nginx.sh b/docker/main/build_nginx.sh
 +printf '%s  %s\n' "$VOD_MODULE_ARCHIVE_SHA256" "$VOD_MODULE_ARCHIVE" | sha256sum --check
 +tar -zxf "$VOD_MODULE_ARCHIVE" -C /tmp/nginx-vod-module --strip-components=1
 +rm "$VOD_MODULE_ARCHIVE"
+     # Patch MAX_CLIPS to allow more clips to be added than the default 128
+ sed -i 's/MAX_CLIPS (128)/MAX_CLIPS (1080)/g' /tmp/nginx-vod-module/vod/media_set.h
+ patch -d /tmp/nginx-vod-module/ -p1 << 'EOF'

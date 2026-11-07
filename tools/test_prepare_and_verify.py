@@ -200,13 +200,19 @@ class DistributionVerificationTests(unittest.TestCase):
             script = root / "docker/main/build_nginx.sh"
             script.parent.mkdir(parents=True)
             original_block = [
+                "wget -nv https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz",
+                "tar -zxf nginx-${NGINX_VERSION}.tar.gz -C /tmp/nginx --strip-components=1",
+                "rm nginx-${NGINX_VERSION}.tar.gz",
                 "mkdir /tmp/nginx-vod-module",
                 "wget -nv https://github.com/kaltura/nginx-vod-module/archive/refs/tags/${VOD_MODULE_VERSION}.tar.gz",
                 "tar -zxf ${VOD_MODULE_VERSION}.tar.gz -C /tmp/nginx-vod-module --strip-components=1",
                 "rm ${VOD_MODULE_VERSION}.tar.gz",
+                "    # Patch MAX_CLIPS to allow more clips to be added than the default 128",
+                "sed -i 's/MAX_CLIPS (128)/MAX_CLIPS (1080)/g' /tmp/nginx-vod-module/vod/media_set.h",
+                "patch -d /tmp/nginx-vod-module/ -p1 << 'EOF'",
             ]
             script.write_text(
-                "".join(f"# context {index}\n" for index in range(32))
+                "".join(f"# context {index}\n" for index in range(29))
                 + "\n".join(original_block)
                 + "\n",
                 encoding="utf-8",

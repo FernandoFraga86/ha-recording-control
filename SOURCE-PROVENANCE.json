@@ -18,6 +18,8 @@
   },
   "build_source_fallback": {
     "scope": "build-time source acquisition only; no Frigate runtime logic changed",
+    "patch_path": "patches/distribution-build-source-fallback-1.patch",
+    "patch_sha256": "7116976ccf59ae3ecdbe1ebb752039d6f2f455f77993c96318617e0a5e9cbda1",
     "upstream_file": "docker/main/build_nginx.sh",
     "module": "kaltura/nginx-vod-module",
     "version": "1.31",
