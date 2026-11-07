@@ -56,8 +56,8 @@ def validate_lock() -> None:
     print("Distribution lock, false readiness gates, and all three exact image digests verified.")
 
 
-def docker(*args: str, capture: bool = False, check: bool = True) -> str:
-    result = subprocess.run(
+def docker_result(*args: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
         ["docker", *args],
         check=False,
         stdout=subprocess.PIPE if capture else None,
@@ -65,6 +65,10 @@ def docker(*args: str, capture: bool = False, check: bool = True) -> str:
         text=True,
         encoding="utf-8",
     )
+
+
+def docker(*args: str, capture: bool = False, check: bool = True) -> str:
+    result = docker_result(*args, capture=capture)
     if check and result.returncode != 0:
         output = result.stdout or ""
         raise RuntimeError(f"docker {' '.join(args[:4])} failed (exit {result.returncode}): {output[-4000:]}")
@@ -234,9 +238,11 @@ def wait_phase(path: Path, expected: str, timeout: int, description: str) -> dic
                 time.sleep(0.5)
                 continue
             if data.get("phase") == "failed":
+                diagnostic = data.get("diagnostic")
+                detail = f"; diagnostic={diagnostic}" if isinstance(diagnostic, str) and diagnostic else ""
                 raise RuntimeError(
                     f"Home Assistant lab helper failed at {data.get('step', 'unknown')}: "
-                    f"{data.get('error_type', 'unknown error')}"
+                    f"{data.get('error_type', 'unknown error')}{detail}"
                 )
             if data.get("phase") == expected:
                 return data
@@ -254,7 +260,7 @@ def wait_frigate_api(name: str, timeout: int = 240) -> dict[str, Any]:
     last = "not yet available"
     while time.monotonic() < deadline:
         require_running(name)
-        result = docker("exec", name, "python3", "-c", probe, capture=True, check=False)
+        result = docker_result("exec", name, "python3", "-c", probe, capture=True)
         if result.returncode == 0:
             data = json.loads(result.stdout)
             version = str(data.get("version", ""))
@@ -316,7 +322,7 @@ except urllib.error.HTTPError as error:
     print(error.code)
     raise SystemExit(0 if error.code in (401, 403) else 1)
 """
-    result = docker("exec", name, "python3", "-c", script, capture=True, check=False)
+    result = docker_result("exec", name, "python3", "-c", script, capture=True)
     if result.returncode != 0 or result.stdout.strip() not in {"401", "403"}:
         raise RuntimeError(f"Frigate-to-HA API reachability/auth probe failed: {(result.stdout or '')[-1000:]}")
     print(f"Frigate container reached the Home Assistant API; unauthenticated request correctly received HTTP {result.stdout.strip()}.")
@@ -331,7 +337,7 @@ def stop_and_remove(names: list[str], network: str, *, require_clean: bool) -> l
         state = inspected["State"]
         if state.get("Running"):
             stop_started = time.monotonic()
-            result = docker("stop", "--time", "30", name, capture=True, check=False)
+            result = docker_result("stop", "--time", "30", name, capture=True)
             stop_elapsed = time.monotonic() - stop_started
             if result.returncode != 0:
                 errors.append(f"could not stop {name} cleanly")
@@ -432,7 +438,7 @@ def run_lab() -> None:
         availability_deadline = time.monotonic() + 110
         while time.monotonic() < availability_deadline:
             require_running(frigate)
-            result = docker("exec", broker, "sh", "-c", f"test -s {log_path}", check=False)
+            result = docker_result("exec", broker, "sh", "-c", f"test -s {log_path}", capture=True)
             if result.returncode == 0:
                 availability = docker("exec", broker, "cat", log_path, capture=True)
                 if availability.strip() != "online":

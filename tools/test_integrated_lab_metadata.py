@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tools.integrated_service_lab import inspect_optional, validate_runner_temp_root
+from tools.integrated_service_lab import docker_result, inspect_optional, validate_runner_temp_root
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +40,14 @@ class IntegratedLabMetadataTests(unittest.TestCase):
         run.return_value.stdout = "Docker daemon unavailable"
         with self.assertRaises(RuntimeError):
             inspect_optional("container", "lab-only")
+
+    @patch("tools.integrated_service_lab.subprocess.run")
+    def test_docker_result_preserves_exit_status_for_callers(self, run) -> None:
+        run.return_value.returncode = 7
+        run.return_value.stdout = "synthetic diagnostic"
+        result = docker_result("version", capture=True)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout, "synthetic diagnostic")
 
     def test_published_artifact_metadata_is_synchronized_and_non_installable(self) -> None:
         lock = json.loads((ROOT / "distribution-lock.json").read_text(encoding="utf-8"))

@@ -15,6 +15,7 @@ import aiohttp
 BASE = "http://127.0.0.1:8123"
 STATUS = Path("/lab-control/ha-result.json")
 CURRENT_STEP = "startup"
+CURRENT_DIAGNOSTIC: str | None = None
 
 
 def write_status(phase: str, **fields: object) -> None:
@@ -44,7 +45,7 @@ async def request_json(
 
 
 async def main(run_id: str) -> None:
-    global CURRENT_STEP
+    global CURRENT_STEP, CURRENT_DIAGNOSTIC
     timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         CURRENT_STEP = "wait_for_core_onboarding"
@@ -103,6 +104,12 @@ async def main(run_id: str) -> None:
         CURRENT_STEP = "verify_authenticated_core_api"
         status, api_health = await request_json(session, "GET", BASE + "/api", token=token)
         if status != 200 or not isinstance(api_health, dict) or api_health.get("message") != "API running.":
+            if isinstance(api_health, dict):
+                keys = ",".join(sorted(str(key) for key in api_health.keys())[:12])
+                message = str(api_health.get("message", ""))[:120]
+                CURRENT_DIAGNOSTIC = f"http_status={status}; payload_keys={keys}; message={message!r}"
+            else:
+                CURRENT_DIAGNOSTIC = f"http_status={status}; payload_type={type(api_health).__name__}"
             raise RuntimeError("authenticated Core REST API probe failed")
 
         CURRENT_STEP = "open_real_mqtt_config_flow"
@@ -238,6 +245,7 @@ if __name__ == "__main__":
                 "failed",
                 step=CURRENT_STEP,
                 error_type=type(error).__name__,
+                diagnostic=CURRENT_DIAGNOSTIC,
             )
         except OSError:
             pass
