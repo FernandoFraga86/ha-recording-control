@@ -87,7 +87,7 @@ jobs:
           fi
           printf '%s\n' \
             "### Upstream Vitest limitation" \
-            "The pinned upstream `vite.config.ts` points to `web/__test__/test-setup.ts`, which is absent from the pinned commit. The initial Vitest attempt aborted before executing any tests; it is recorded as unavailable, not passed. This run uses lint, Playwright E2E discovery/execution, and the production build instead." \
+            "The pinned upstream vite.config.ts points to web/__test__/test-setup.ts, which is absent from the pinned commit. The initial Vitest attempt aborted before executing any tests; it is recorded as unavailable, not passed. This run uses lint, Playwright E2E discovery/execution, and the production build instead." \
             >> "$GITHUB_STEP_SUMMARY"
           npm run lint
           npx playwright test --config e2e/playwright.config.ts --list
@@ -329,7 +329,7 @@ jobs:
               printf '%s' "$manifest_response" | python3 -c 'import json, sys; manifest=json.load(sys.stdin); assert manifest.get("name") == "HA Recording Control" and manifest.get("short_name") == "HA Recording Control"'
               printf 'Synthetic isolated API response: %s\n' "$response"
               echo "Synthetic isolated web manifest: $manifest_response"
-              printf '%s\n' "Image smoke-start passed: Frigate API answered `/api/version`, the neutral `/site.webmanifest` was served, and the active Nginx config parsed the secure-token directives under `--network none` with an empty synthetic camera configuration." >> "$GITHUB_STEP_SUMMARY"
+              printf '%s\n' "Image smoke-start passed: Frigate API answered /api/version, the neutral /site.webmanifest was served, and the active Nginx config parsed the secure-token directives with Docker network disabled and an empty synthetic camera configuration." >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
             sleep 5
@@ -377,11 +377,11 @@ jobs:
           {
             echo "### Experimental image published"
             echo
-            echo "- Image: `$IMAGE:$IMAGE_TAG`"
-            echo "- Platform: `linux/amd64`"
-            echo "- OCI digest: `$digest`"
+            echo "- Image: $IMAGE:$IMAGE_TAG"
+            echo "- Platform: linux/amd64"
+            echo "- OCI digest: $digest"
             echo "- Anonymous GHCR manifest access: verified"
-            echo "- Workflow source commit: `$GITHUB_SHA`"
+            echo "- Workflow source commit: $GITHUB_SHA"
             echo "- This does not authorize Supervisor installation or production use."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"

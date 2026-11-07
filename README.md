@@ -1,6 +1,6 @@
 # Home Assistant Recording Control — experimental distribution candidate
 
-**Status: EXPERIMENTAL — NOT INSTALLABLE — IMAGE BUILD/PUBLISH NOT YET VERIFIED.**
+**Status: EXPERIMENTAL — PUBLIC IMAGE AVAILABLE FOR LAB REVIEW ONLY — NOT INSTALLABLE OR PRODUCTION-READY.**
 
 This repository contains a source patch for an unofficial Home Assistant app that integrates with Frigate, plus Supervisor metadata templates. It is for review only. It is not an official Frigate or Home Assistant project and is not ready for installation or production use.
 
@@ -12,7 +12,7 @@ This repository contains a source patch for an unofficial Home Assistant app tha
 - Published patch file SHA-256: `512f404a274aeb11a3e26246cddae48a62539cc01ccb10d6a297c5ea42221b65`.
 - Distribution branding patch SHA-256: `35dddbc08947abb8db1b97e7faeb4855d323f8f0fa722db9756afcf20a2e0a6a`.
 - Current candidate app/image version string: `0.18.2-recording-control-1ca90f8-rebrand1-rootfs1`.
-- Planned image reference: `ghcr.io/fernandofraga86/ha-recording-control:0.18.2-recording-control-1ca90f8-rebrand1-rootfs1`.
+- Published experimental image: `ghcr.io/fernandofraga86/ha-recording-control:0.18.2-recording-control-1ca90f8-rebrand1-rootfs1`.
 
 The repository contains source patches against the pinned upstream base, verification and image-repacking tools, the manual GitHub Actions build workflow, and `.template` Supervisor files. It does not include the full upstream source tree, a locally built image, household configuration, camera addresses or credentials, recordings, backups, or host/VM identifiers.
 
@@ -21,6 +21,17 @@ For privacy, one synthetic username in a test fixture was generalized from a hou
 The app template intentionally retains the candidate's Supervisor API, Home Assistant API, MQTT, media, app-configuration, and Home Assistant configuration mappings. Their final necessity and privacy impact have not been revalidated for this public candidate; do not install the template.
 
 ## Distribution and validation status
+
+### Current published artifact — 2026-11-07
+
+The historical run notes below are retained as troubleshooting history; earlier statements that no image had been published or that another run was still required are superseded by this result.
+
+- Image: `ghcr.io/fernandofraga86/ha-recording-control:0.18.2-recording-control-1ca90f8-rebrand1-rootfs1` (`linux/amd64`).
+- OCI digest: `sha256:e024fe700120021c710c08bd28d7e65e5f24442755a0381c028bdf3596ebf7c4`.
+- GitHub Actions run: [42419650533](https://github.com/FernandoFraga86/ha-recording-control/actions/runs/42419650533), source commit `d293c1a58c386a625de83af8ed31e20bf6072d86`; the run concluded successfully, including Playwright, image/layer checks, synthetic no-camera smoke, publication, and anonymous manifest verification.
+- An independent unauthenticated GHCR manifest read returned HTTP 200 and the same digest.
+- Post-run review found shell interpolation warnings only in generated workflow-summary text; the workflow wording is corrected in the current source. This documentation/summary-only fix does not change image contents. The publishing workflow was not rerun against the already-present tag; it intentionally refuses tag overwrite.
+- This is only an experimental public artifact. It has not been installed in Home Assistant/Supervisor; no production recovery, household privacy, or physical-device behavior is thereby validated. `production_ready=false`, `installable=false`, and `native_recovery_enabled=false` remain in force.
 
 The visual distribution delta removes 12 upstream Frigate logo/icon/favicon assets and replaces the app-facing identity with original `HA Recording Control` artwork. The server/runtime overlay is constrained by exact SHA-256 checks in `candidate-verification.json`; the branding patch does not change the security/runtime source files. The direct-from-source image build stopped at the unavailable Kaltura `nginx-secure-token-module` 1.5 archive in run `42403520281`. The current `rootfs1` strategy instead starts from the exact official Frigate 0.18.2 OCI image: tag index `sha256:fd60f99ffd4eb6c42360ed4e14953e270586f239309ab3983e55b2e97ffac09a`, `linux/amd64` manifest `sha256:9ebab4801be69ab4ebc7f6ab1d582c859ff7412d457a3fa550056894e8444dad`, and config `sha256:d8c79fd30635c830c5972dbc61c8c6c789af2373c654e7f4de1073eef435c982`. The workflow verifies the official tag-to-manifest relationship, compares the image's Python source tree with the pinned upstream commit, replaces the candidate server and compiled UI, then exports and imports a flattened root filesystem so protected logos do not remain in lower OCI layers. It reconstructs and checks the supported runtime configuration and refuses unexpected volumes or unsupported metadata. The secure-token Nginx module is inherited from the pinned official image and must pass compile-flag, active-config parsing, and synthetic manifest behavior checks before publication. Upstream copyright, MIT license, trademark policy, and brand-asset attribution text are retained in the image.
 
