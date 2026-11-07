@@ -49,7 +49,7 @@
     },
     "verified_alternate_source": null,
     "status": "direct-source-build dependency unavailable; not used by the digest-pinned official-image strategy",
-    "runtime_validation": "pending against the official image and active Nginx configuration"
+    "runtime_validation": "verified in build/publication run 42419650533 against the published linux/amd64 image: compile flags, active Nginx configuration parsing, and synthetic tokenized-manifest response"
   },
   "candidate_version": "0.18.2-recording-control-1ca90f8-rebrand1-rootfs1",
   "image": {
@@ -66,8 +66,13 @@
       "config_digest": "sha256:d8c79fd30635c830c5972dbc61c8c6c789af2373c654e7f4de1073eef435c982",
       "upstream_commit": "cfa08c56b23d23280c3d0a218e5a43182c97445b"
     },
-    "published": false,
-    "oci_digest": null,
+    "published": true,
+    "oci_digest": "sha256:e024fe700120021c710c08bd28d7e65e5f24442755a0381c028bdf3596ebf7c4",
+    "publication_run_id": "42419650533",
+    "publication_workflow_commit": "d293c1a58c386a625de83af8ed31e20bf6072d86",
+    "anonymous_manifest_read_verified": true,
+    "manifest_media_type": "application/vnd.docker.distribution.manifest.v2+json",
+    "oci_index_digest": null,
     "production_ready": false,
     "installable": false,
     "native_recovery_enabled": false
@@ -78,5 +83,16 @@
     "runtime_source_changed": false,
     "original_unsanitized_patch_sha256": "b85a726da23d8253791d3be00bf86824ae2e6c14daa4ab281daddef3abbdb88c"
   },
-  "test_claim": "The exact source reconstruction and UI/runtime checks are enforced by the manual GitHub Actions workflow; no result is claimed until that workflow completes."
+  "integrated_lab": {
+    "status": "pending",
+    "scope": "synthetic Home Assistant Core 2026.10.2, Mosquitto 2.1.2, and experimental Frigate service integration; not Supervisor or production validation",
+    "network_policy": "temporary internal Docker network; no published ports or external container egress",
+    "workflow_run_id": null,
+    "images": {
+      "home_assistant_core_linux_amd64": "ghcr.io/home-assistant/home-assistant@sha256:d30d46d24d55c43f1122ab04fdf04d2d31144815b983b07feb075f3a18814239",
+      "mosquitto_linux_amd64": "docker.io/library/eclipse-mosquitto@sha256:22075095e8790eec5592ff3c213b1974cd51aa458275af2f8b0595af4c385df2",
+      "frigate_experimental_linux_amd64": "ghcr.io/fernandofraga86/ha-recording-control@sha256:e024fe700120021c710c08bd28d7e65e5f24442755a0381c028bdf3596ebf7c4"
+    }
+  },
+  "test_claim": "The published artifact is bound to build/publication run 42419650533 and its anonymous manifest verification. Integrated Core/Mosquitto/Frigate service testing is a separate pending gate; neither publication nor that test implies Supervisor installation, household privacy, recovery, or production readiness."
 }

@@ -43,19 +43,44 @@
     "base_index_digest": "sha256:fd60f99ffd4eb6c42360ed4e14953e270586f239309ab3983e55b2e97ffac09a",
     "base_linux_amd64_manifest_digest": "sha256:9ebab4801be69ab4ebc7f6ab1d582c859ff7412d457a3fa550056894e8444dad",
     "base_config_digest": "sha256:d8c79fd30635c830c5972dbc61c8c6c789af2373c654e7f4de1073eef435c982",
-    "published": false,
+    "published": true,
     "installable": false,
     "registry_tag_immutability_verified": false,
     "oci_index_digest": null,
-    "platform_digest_amd64": null,
-    "workflow_commit": null
+    "platform_digest_amd64": "sha256:e024fe700120021c710c08bd28d7e65e5f24442755a0381c028bdf3596ebf7c4",
+    "workflow_commit": "d293c1a58c386a625de83af8ed31e20bf6072d86",
+    "publication_run_id": "42419650533",
+    "anonymous_manifest_read_verified": true,
+    "anonymous_manifest_read_http_status": 200
+  },
+  "integrated_lab": {
+    "status": "pending",
+    "scope": "synthetic Home Assistant Core, Mosquitto, and Frigate service integration only; no Supervisor installation, household configuration, camera feeds, or physical-device validation",
+    "network_policy": "temporary Docker bridge with internal isolation, no published ports, no external container egress",
+    "images": {
+      "home_assistant_core": {
+        "tag": "ghcr.io/home-assistant/home-assistant:2026.10.2",
+        "index_digest": "sha256:33afb0659d786213264c2211f8d91c5fe87461c56eba6a3a546eb05fc71e89f4",
+        "linux_amd64_digest": "sha256:d30d46d24d55c43f1122ab04fdf04d2d31144815b983b07feb075f3a18814239"
+      },
+      "mosquitto": {
+        "tag": "docker.io/library/eclipse-mosquitto:2.1.2-alpine",
+        "index_digest": "sha256:75d6662dee52c947dc9dd9c29f1d8d7ffef78ddaf38001caa09755681e8bbc98",
+        "linux_amd64_digest": "sha256:22075095e8790eec5592ff3c213b1974cd51aa458275af2f8b0595af4c385df2"
+      },
+      "frigate_experimental": {
+        "tag": "ghcr.io/fernandofraga86/ha-recording-control:0.18.2-recording-control-1ca90f8-rebrand1-rootfs1",
+        "index_digest": null,
+        "linux_amd64_digest": "sha256:e024fe700120021c710c08bd28d7e65e5f24442755a0381c028bdf3596ebf7c4"
+      }
+    },
+    "workflow_run_id": null
   },
   "installable": false,
   "blocking_gates": [
-    "experimental image build and OCI digest verification pending",
-    "public anonymous registry read verification pending",
+    "integrated synthetic Core, Mosquitto, and Frigate service test pending",
     "target Supervisor load/install validation pending",
     "startup recovery and privacy acceptance validation pending",
-    "full runnable-derivative branding and UI validation pending"
+    "independent backup restore and executable production rollback validation pending"
   ]
 }

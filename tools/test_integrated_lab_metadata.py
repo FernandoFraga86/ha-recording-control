@@ -1,0 +1,90 @@
+"""Guard the published-artifact and integrated-lab metadata contract."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import re
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class IntegratedLabMetadataTests(unittest.TestCase):
+    def test_published_artifact_metadata_is_synchronized_and_non_installable(self) -> None:
+        lock = json.loads((ROOT / "distribution-lock.json").read_text(encoding="utf-8"))
+        provenance = json.loads((ROOT / "SOURCE-PROVENANCE.json").read_text(encoding="utf-8"))
+        image = lock["image"]
+        source_image = provenance["image"]
+
+        self.assertTrue(image["published"])
+        self.assertTrue(source_image["published"])
+        self.assertEqual(image["platform_digest_amd64"], source_image["oci_digest"])
+        self.assertEqual(image["workflow_commit"], source_image["publication_workflow_commit"])
+        self.assertEqual(image["publication_run_id"], source_image["publication_run_id"])
+        self.assertEqual(
+            image["platform_digest_amd64"],
+            "sha256:e024fe700120021c710c08bd28d7e65e5f24442755a0381c028bdf3596ebf7c4",
+        )
+        self.assertIsNone(image["oci_index_digest"])
+        self.assertFalse(lock["installable"])
+        self.assertFalse(lock["production_ready"])
+        self.assertFalse(lock["native_recovery_enabled"])
+        self.assertFalse(source_image["installable"])
+        self.assertFalse(source_image["production_ready"])
+        self.assertFalse(source_image["native_recovery_enabled"])
+
+    def test_integrated_lab_images_are_pinned_identically_in_lock_and_provenance(self) -> None:
+        lock = json.loads((ROOT / "distribution-lock.json").read_text(encoding="utf-8"))
+        provenance = json.loads((ROOT / "SOURCE-PROVENANCE.json").read_text(encoding="utf-8"))
+        refs = {
+            "HA_IMAGE": "ghcr.io/home-assistant/home-assistant@"
+            + lock["integrated_lab"]["images"]["home_assistant_core"]["linux_amd64_digest"],
+            "MOSQUITTO_IMAGE": "docker.io/library/eclipse-mosquitto@"
+            + lock["integrated_lab"]["images"]["mosquitto"]["linux_amd64_digest"],
+            "FRIGATE_IMAGE": lock["integrated_lab"]["images"]["frigate_experimental"]["tag"].split(":", 1)[0]
+            + "@"
+            + lock["integrated_lab"]["images"]["frigate_experimental"]["linux_amd64_digest"],
+        }
+        expected = {
+            "HA_IMAGE": "ghcr.io/home-assistant/home-assistant@sha256:d30d46d24d55c43f1122ab04fdf04d2d31144815b983b07feb075f3a18814239",
+            "MOSQUITTO_IMAGE": "docker.io/library/eclipse-mosquitto@sha256:22075095e8790eec5592ff3c213b1974cd51aa458275af2f8b0595af4c385df2",
+            "FRIGATE_IMAGE": "ghcr.io/fernandofraga86/ha-recording-control@sha256:e024fe700120021c710c08bd28d7e65e5f24442755a0381c028bdf3596ebf7c4",
+        }
+        self.assertEqual(refs, expected)
+        for ref in refs.values():
+            self.assertRegex(ref, re.compile(r".+@sha256:[0-9a-f]{64}"))
+        provenance_refs = provenance["integrated_lab"]["images"]
+        self.assertEqual(provenance_refs["home_assistant_core_linux_amd64"], refs["HA_IMAGE"])
+        self.assertEqual(provenance_refs["mosquitto_linux_amd64"], refs["MOSQUITTO_IMAGE"])
+        self.assertEqual(provenance_refs["frigate_experimental_linux_amd64"], refs["FRIGATE_IMAGE"])
+        self.assertEqual(lock["integrated_lab"]["status"], "pending")
+        self.assertEqual(provenance["integrated_lab"]["status"], "pending")
+
+    def test_workflow_preflights_before_pulls_and_never_publishes_ports_or_images(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "integrated-service-lab.yml").read_text(
+            encoding="utf-8"
+        )
+        preflight = workflow.index("Preflight runner disk, memory, and CPU before image pulls")
+        first_pull = workflow.index('docker pull --platform linux/amd64 "$HA_IMAGE"')
+        self.assertLess(preflight, first_pull)
+        self.assertIn("20 * 1024 * 1024 * 1024", workflow)
+        self.assertIn("8 * 1024 * 1024", workflow)
+        self.assertIn("permissions: {}", workflow)
+        self.assertIn("contents: read", workflow)
+        self.assertNotIn("packages: write", workflow)
+        self.assertNotIn("docker push", workflow)
+        self.assertNotIn("docker run -p ", workflow)
+
+        runner = (ROOT / "tools" / "integrated_service_lab.py").read_text(encoding="utf-8")
+        self.assertIn('"--internal"', runner)
+        self.assertIn("verify_container_isolated", runner)
+        self.assertIn("ha_recording_control_ci", runner)
+        self.assertIn("record:\\n", runner)
+        self.assertIn("  enabled: false\\n", runner)
+        self.assertNotIn('"ports",', runner)
+
+
+if __name__ == "__main__":
+    unittest.main()

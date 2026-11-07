@@ -22,6 +22,10 @@ The app template intentionally retains the candidate's Supervisor API, Home Assi
 
 ## Distribution and validation status
 
+### Integrated synthetic service lab — pending
+
+The separate manual workflow .github/workflows/integrated-service-lab.yml uses only three linux/amd64 images pinned by manifest digest: Home Assistant Core 2026.10.2 (sha256:d30d46d24d55c43f1122ab04fdf04d2d31144815b983b07feb075f3a18814239), Mosquitto 2.1.2 (sha256:22075095e8790eec5592ff3c213b1974cd51aa458275af2f8b0595af4c385df2), and this experimental Frigate image (sha256:e024fe700120021c710c08bd28d7e65e5f24442755a0381c028bdf3596ebf7c4). Before any image pull, the hosted runner must have at least 20 GiB free disk, 8 GiB available memory, and 4 CPUs; otherwise the workflow stops before pulls. The test uses a temporary Docker internal network, no published ports, no external container egress, no cameras, and disposable Core onboarding. It checks service/API/MQTT integration with synthetic messages only. It cannot validate the Supervisor app, household entities or camera privacy, recording recovery, physical behavior, or production readiness. The lab status remains pending until a complete run is independently reviewed.
+
 ### Current published artifact — 2026-11-07
 
 The historical run notes below are retained as troubleshooting history; earlier statements that no image had been published or that another run was still required are superseded by this result.

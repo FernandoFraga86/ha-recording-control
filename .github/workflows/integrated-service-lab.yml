@@ -1,0 +1,69 @@
+name: Integrated synthetic service lab
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ha-recording-control-integrated-service-lab
+  cancel-in-progress: false
+
+jobs:
+  synthetic-integration:
+    if: github.repository == 'FernandoFraga86/ha-recording-control' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      HA_IMAGE: ghcr.io/home-assistant/home-assistant@sha256:d30d46d24d55c43f1122ab04fdf04d2d31144815b983b07feb075f3a18814239
+      MOSQUITTO_IMAGE: docker.io/library/eclipse-mosquitto@sha256:22075095e8790eec5592ff3c213b1974cd51aa458275af2f8b0595af4c385df2
+      FRIGATE_IMAGE: ghcr.io/fernandofraga86/ha-recording-control@sha256:e024fe700120021c710c08bd28d7e65e5f24442755a0381c028bdf3596ebf7c4
+
+    steps:
+      - name: Checkout the pinned-image test harness
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Preflight runner disk, memory, and CPU before image pulls
+        shell: bash
+        run: |
+          set -euo pipefail
+          disk_available="$(df --output=avail -B1 / | tail -n 1 | tr -d ' ')"
+          memory_available_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+          cpu_count="$(nproc)"
+          required_disk_bytes="$((20 * 1024 * 1024 * 1024))"
+          required_memory_kib="$((8 * 1024 * 1024))"
+          printf 'Preflight before image pulls: disk=%s bytes, MemAvailable=%s KiB, CPUs=%s\n' \
+            "$disk_available" "$memory_available_kib" "$cpu_count"
+          {
+            echo '### Integrated lab runner preflight'
+            echo
+            echo "- Free disk before pulls: $disk_available bytes (minimum: $required_disk_bytes)."
+            echo "- Available memory: $memory_available_kib KiB (minimum: $required_memory_kib KiB)."
+            echo "- CPU count: $cpu_count (minimum: 4)."
+            echo '- No cleanup, paid runner, local Docker Desktop, or household endpoint is used.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if (( disk_available < required_disk_bytes || memory_available_kib < required_memory_kib || cpu_count < 4 )); then
+            echo 'Runner capacity is below the safe preflight; stopping before any image pull.' >&2
+            exit 1
+          fi
+          docker version
+          python3 --version
+
+      - name: Validate locked digests and pull only the three pinned amd64 images
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/integrated_service_lab.py validate-lock
+          docker pull --platform linux/amd64 "$HA_IMAGE"
+          docker pull --platform linux/amd64 "$MOSQUITTO_IMAGE"
+          docker pull --platform linux/amd64 "$FRIGATE_IMAGE"
+          python3 tools/integrated_service_lab.py verify-images
+
+      - name: Run the isolated Core, MQTT, and Frigate synthetic integration
+        shell: bash
+        run: python3 tools/integrated_service_lab.py run
