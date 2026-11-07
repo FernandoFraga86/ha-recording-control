@@ -118,6 +118,43 @@ def oci_tar_bytes(
     return image_stream.getvalue()
 
 
+def docker_blob_tar_bytes(
+    files: dict[str, bytes], *, layer_reference_digest: str | None = None
+) -> bytes:
+    layer_stream = io.BytesIO()
+    with tarfile.open(fileobj=layer_stream, mode="w") as layer:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            layer.addfile(info, io.BytesIO(content))
+
+    layer_bytes = layer_stream.getvalue()
+    config_bytes = b'{"architecture":"amd64","os":"linux"}'
+    layer_digest = hashlib.sha256(layer_bytes).hexdigest()
+    config_digest = hashlib.sha256(config_bytes).hexdigest()
+    manifest = [
+        {
+            "Config": f"blobs/sha256/{config_digest}",
+            "RepoTags": ["synthetic:blob-layout"],
+            "Layers": [
+                f"blobs/sha256/{layer_reference_digest or layer_digest}"
+            ],
+        }
+    ]
+    outer_members = {
+        "manifest.json": json.dumps(manifest, separators=(",", ":")).encode("utf-8"),
+        f"blobs/sha256/{config_digest}": config_bytes,
+        f"blobs/sha256/{layer_digest}": layer_bytes,
+    }
+    image_stream = io.BytesIO()
+    with tarfile.open(fileobj=image_stream, mode="w") as image:
+        for name, content in outer_members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            image.addfile(info, io.BytesIO(content))
+    return image_stream.getvalue()
+
+
 class DistributionVerificationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(dir=TOOLS)
@@ -274,6 +311,21 @@ class DistributionVerificationTests(unittest.TestCase):
         archive = oci_tar_bytes(
             {"opt/frigate/web/images/ha-recording-control.svg": b"<svg/>"},
             layer_descriptor_digest="0" * 64,
+        )
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.run_layer_check(archive)
+
+    def test_docker_manifest_with_digest_named_blob_layers_passes(self) -> None:
+        self.run_layer_check(
+            docker_blob_tar_bytes(
+                {"opt/frigate/web/images/ha-recording-control.svg": b"<svg/>"}
+            )
+        )
+
+    def test_docker_manifest_rejects_missing_digest_named_layer(self) -> None:
+        archive = docker_blob_tar_bytes(
+            {"opt/frigate/web/images/ha-recording-control.svg": b"<svg/>"},
+            layer_reference_digest="0" * 64,
         )
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.run_layer_check(archive)

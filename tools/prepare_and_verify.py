@@ -440,13 +440,41 @@ def verify_image_layers(args: argparse.Namespace) -> None:
     if legacy_manifest is not None:
         if not isinstance(legacy_manifest, list) or not legacy_manifest:
             fail("Docker image manifest.json is empty or malformed")
+        referenced_legacy_layers: set[str] = set()
+        referenced_blob_layers: set[str] = set()
         for image in legacy_manifest:
             layers = image.get("Layers") if isinstance(image, dict) else None
             if not isinstance(layers, list) or not layers:
                 fail("Docker image manifest does not enumerate its filesystem layers")
-            missing_layers = set(layers) - legacy_layer_names
-            if missing_layers:
-                fail(f"Docker image manifest references missing layers: {sorted(missing_layers)}")
+            for layer_reference in layers:
+                if not isinstance(layer_reference, str):
+                    fail("Docker image manifest has a malformed layer reference")
+                if layer_reference in legacy_layer_names:
+                    referenced_legacy_layers.add(layer_reference)
+                    continue
+                blob_match = re.fullmatch(r"blobs/sha256/([0-9a-f]{64})", layer_reference)
+                if blob_match is None:
+                    fail(f"Docker image manifest has an unsupported layer reference: {layer_reference}")
+                blob_digest = blob_match.group(1)
+                record = blob_records.get(blob_digest)
+                if record is None or record.get("kind") != "layer":
+                    fail(f"Docker image manifest references a missing or invalid layer: {layer_reference}")
+                referenced_blob_layers.add(blob_digest)
+
+            config_reference = image.get("Config") if isinstance(image, dict) else None
+            if isinstance(config_reference, str):
+                config_match = re.fullmatch(r"blobs/sha256/([0-9a-f]{64})", config_reference)
+                if config_match is not None:
+                    config_record = blob_records.get(config_match.group(1))
+                    if config_record is None or config_record.get("kind") != "json":
+                        fail(f"Docker image manifest references a missing or invalid config: {config_reference}")
+        all_blob_layers = {
+            digest for digest, record in blob_records.items() if record.get("kind") == "layer"
+        }
+        if referenced_legacy_layers != legacy_layer_names:
+            fail("Docker image manifest does not reference every legacy filesystem layer")
+        if referenced_blob_layers != all_blob_layers:
+            fail("Docker image manifest does not reference every OCI filesystem layer blob")
         archive_formats += 1
 
     if oci_layout is not None or oci_index is not None:
@@ -510,6 +538,11 @@ def verify_image_layers(args: argparse.Namespace) -> None:
             visit_manifest(descriptor)
         if not referenced_layers:
             fail("OCI image index references no inspected filesystem layers")
+        all_blob_layers = {
+            digest for digest, record in blob_records.items() if record.get("kind") == "layer"
+        }
+        if referenced_layers != all_blob_layers:
+            fail("OCI image index does not reference every filesystem layer blob")
         archive_formats += 1
 
     if archive_formats == 0:
