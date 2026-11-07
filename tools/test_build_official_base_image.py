@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import unittest
+from pathlib import Path
 
 from build_official_base_image import (
     docker_import_changes,
+    pinned_patch_labels,
     pinned_upstream_commit,
     verify_oci_index,
     verify_oci_manifest,
@@ -60,6 +62,23 @@ class OfficialImageBuildTests(unittest.TestCase):
         self.assertEqual(pinned_upstream_commit({"upstream": {"commit": commit}}), commit)
         with self.assertRaises(SystemExit):
             pinned_upstream_commit({"source": {"upstream_base_commit": commit}})
+
+    def test_candidate_patch_labels_match_actual_verification_manifest(self) -> None:
+        manifest_path = Path(__file__).resolve().parents[1] / "candidate-verification.json"
+        verification = json.loads(manifest_path.read_text(encoding="utf-8"))
+        labels = pinned_patch_labels(verification)
+        self.assertEqual(
+            labels,
+            {
+                "io.ha-recording-control.source-overlay-patch-sha256": "512f404a274aeb11a3e26246cddae48a62539cc01ccb10d6a297c5ea42221b65",
+                "io.ha-recording-control.branding-patch-sha256": "35dddbc08947abb8db1b97e7faeb4855d323f8f0fa722db9756afcf20a2e0a6a",
+                "io.ha-recording-control.distribution-build-source-patch-sha256": "2f093d99c1f77d9869eeb1a70d54b8c66e0112fbc1c511aec4dceb58e4e28d1c",
+            },
+        )
+
+    def test_candidate_patch_labels_reject_missing_or_malformed_hashes(self) -> None:
+        with self.assertRaises(SystemExit):
+            pinned_patch_labels({"patches": {"source_overlay": {"sha256": "bad"}}})
 
     def test_docker_import_reconstructs_official_runtime_settings(self) -> None:
         config = {

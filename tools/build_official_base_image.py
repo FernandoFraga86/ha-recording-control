@@ -62,6 +62,25 @@ def pinned_upstream_commit(verification: dict[str, Any]) -> str:
     return commit
 
 
+def pinned_patch_labels(verification: dict[str, Any]) -> dict[str, str]:
+    patches = verification.get("patches")
+    if not isinstance(patches, dict):
+        fail("candidate verification lock is missing its patch manifest")
+    label_names = {
+        "source_overlay": "io.ha-recording-control.source-overlay-patch-sha256",
+        "distribution_branding": "io.ha-recording-control.branding-patch-sha256",
+        "distribution_build_source": "io.ha-recording-control.distribution-build-source-patch-sha256",
+    }
+    labels: dict[str, str] = {}
+    for patch_name, label_name in label_names.items():
+        entry = patches.get(patch_name)
+        digest = entry.get("sha256") if isinstance(entry, dict) else None
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            fail(f"candidate verification lock is missing a valid SHA-256 for {patch_name}")
+        labels[label_name] = digest
+    return labels
+
+
 def verify_oci_index(raw: bytes, expected_digest: str, expected_child: str) -> dict[str, Any]:
     expected_digest = parse_digest(expected_digest, "OCI index digest")
     expected_child = parse_digest(expected_child, "linux/amd64 manifest digest")
@@ -310,12 +329,10 @@ def build_image(args: argparse.Namespace) -> None:
         "org.opencontainers.image.base.name": tag_ref,
         "org.opencontainers.image.base.digest": expected_manifest,
         "io.ha-recording-control.upstream-commit": upstream_commit,
-        "io.ha-recording-control.source-overlay-sha256": verification["overlay_sha256"],
-        "io.ha-recording-control.source-patch-sha256": verification["patch_sha256"],
-        "io.ha-recording-control.branding-patch-sha256": verification["branding_variant"]["patch_sha256"],
         "io.ha-recording-control.production-ready": "false",
         "io.ha-recording-control.native-recovery-enabled": "false",
     }
+    labels.update(pinned_patch_labels(verification))
     changes = docker_import_changes(base_config, labels)
     changes_json = json.dumps(changes, ensure_ascii=False, indent=2)
     (temp_root / "docker-import-changes.json").write_text(changes_json, encoding="utf-8")
