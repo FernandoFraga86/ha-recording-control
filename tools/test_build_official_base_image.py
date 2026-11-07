@@ -4,7 +4,12 @@ import hashlib
 import json
 import unittest
 
-from build_official_base_image import docker_import_changes, verify_oci_index, verify_oci_manifest
+from build_official_base_image import (
+    docker_import_changes,
+    pinned_upstream_commit,
+    verify_oci_index,
+    verify_oci_manifest,
+)
 
 
 class OfficialImageBuildTests(unittest.TestCase):
@@ -49,6 +54,12 @@ class OfficialImageBuildTests(unittest.TestCase):
         )
         with self.assertRaises(SystemExit):
             verify_oci_manifest(raw, manifest_digest, "sha256:" + "d" * 64)
+
+    def test_candidate_upstream_commit_is_read_from_verification_lock(self) -> None:
+        commit = "cfa08c56b23d23280c3d0a218e5a43182c97445b"
+        self.assertEqual(pinned_upstream_commit({"upstream": {"commit": commit}}), commit)
+        with self.assertRaises(SystemExit):
+            pinned_upstream_commit({"source": {"upstream_base_commit": commit}})
 
     def test_docker_import_reconstructs_official_runtime_settings(self) -> None:
         config = {

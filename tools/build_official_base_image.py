@@ -54,6 +54,14 @@ def parse_digest(value: str, field: str) -> str:
     return value
 
 
+def pinned_upstream_commit(verification: dict[str, Any]) -> str:
+    upstream = verification.get("upstream")
+    commit = upstream.get("commit") if isinstance(upstream, dict) else None
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        fail("candidate verification lock is missing a valid pinned upstream commit")
+    return commit
+
+
 def verify_oci_index(raw: bytes, expected_digest: str, expected_child: str) -> dict[str, Any]:
     expected_digest = parse_digest(expected_digest, "OCI index digest")
     expected_child = parse_digest(expected_child, "linux/amd64 manifest digest")
@@ -257,8 +265,8 @@ def build_image(args: argparse.Namespace) -> None:
     upstream = args.upstream.resolve(strict=True)
     built_web = args.built_web.resolve(strict=True)
     temp_root = args.temp_root.resolve(strict=True)
-    lock = json.loads((distribution / "distribution-lock.json").read_text(encoding="utf-8"))
     verification = json.loads((distribution / "candidate-verification.json").read_text(encoding="utf-8"))
+    upstream_commit = pinned_upstream_commit(verification)
     base = verification["official_image_base"]
     tag_ref = base["tag_reference"]
     platform_ref = base["platform_reference"]
@@ -301,7 +309,7 @@ def build_image(args: argparse.Namespace) -> None:
         "org.opencontainers.image.description": "Experimental HA Recording Control derivative based on the official Frigate 0.18.2 linux/amd64 image",
         "org.opencontainers.image.base.name": tag_ref,
         "org.opencontainers.image.base.digest": expected_manifest,
-        "io.ha-recording-control.upstream-commit": lock["upstream"]["commit"],
+        "io.ha-recording-control.upstream-commit": upstream_commit,
         "io.ha-recording-control.source-overlay-sha256": verification["overlay_sha256"],
         "io.ha-recording-control.source-patch-sha256": verification["patch_sha256"],
         "io.ha-recording-control.branding-patch-sha256": verification["branding_variant"]["patch_sha256"],
