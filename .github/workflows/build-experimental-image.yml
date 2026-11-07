@@ -74,13 +74,34 @@ jobs:
           npm_config_fund: "false"
         run: npm ci
 
-      - name: Run web unit tests and production build
+      - name: Record upstream Vitest limitation, lint, discover E2E, and build UI
         working-directory: upstream/web
         env:
           CI: "1"
+        shell: bash
         run: |
-          npm test -- --run --maxWorkers=2 --minWorkers=1
+          set -euo pipefail
+          if [[ -e __test__/test-setup.ts ]]; then
+            echo "Pinned upstream test setup unexpectedly exists; review the Vitest gate before proceeding." >&2
+            exit 1
+          fi
+          printf '%s\n' \
+            "### Upstream Vitest limitation" \
+            "The pinned upstream `vite.config.ts` points to `web/__test__/test-setup.ts`, which is absent from the pinned commit. The initial Vitest attempt aborted before executing any tests; it is recorded as unavailable, not passed. This run uses lint, Playwright E2E discovery/execution, and the production build instead." \
+            >> "$GITHUB_STEP_SUMMARY"
+          npm run lint
+          npx playwright test --config e2e/playwright.config.ts --list
           npm run build
+
+      - name: Install Chromium for the pinned Playwright E2E suite
+        working-directory: upstream/web
+        run: npx playwright install --with-deps chromium
+
+      - name: Execute Playwright E2E suite on desktop and mobile projects
+        working-directory: upstream/web
+        env:
+          CI: "1"
+        run: npm run e2e -- --workers=2 --reporter=line
 
       - name: Verify compiled UI assets
         run: >-
@@ -151,6 +172,53 @@ jobs:
             --built-web "$RUNNER_TEMP/image-check/web" \
             --distribution distribution
           echo "Image checks passed for linux/amd64. Image has not yet been published." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke-start image with a synthetic no-camera config
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_root="$RUNNER_TEMP/ha-recording-control-smoke"
+          config_dir="$smoke_root/config"
+          mkdir -p "$config_dir"
+          cat > "$config_dir/config.yml" <<'YAML'
+          mqtt:
+            enabled: false
+          detectors:
+            cpu:
+              type: cpu
+              num_threads: 1
+          cameras: {}
+          version: 0.18-0
+          YAML
+
+          container_name="ha-recording-control-smoke-${GITHUB_RUN_ID}"
+          cleanup() { docker rm -f "$container_name" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker run -d \
+            --name "$container_name" \
+            --network none \
+            --shm-size=256m \
+            --mount "type=bind,source=$config_dir,target=/config" \
+            --tmpfs /media/frigate:rw,size=512m \
+            "$IMAGE:$IMAGE_TAG" >/dev/null
+
+          deadline=$((SECONDS + 240))
+          while (( SECONDS < deadline )); do
+            if ! docker inspect "$container_name" --format '{{.State.Running}}' 2>/dev/null | grep -qx true; then
+              docker logs "$container_name" || true
+              echo "Synthetic service exited before its API became ready." >&2
+              exit 1
+            fi
+            if response="$(docker exec "$container_name" curl --fail --silent --show-error http://127.0.0.1:5000/api/version 2>/dev/null)"; then
+              printf 'Synthetic isolated API response: %s\n' "$response"
+              printf '%s\n' "Image smoke-start passed: Frigate API answered `/api/version` under `--network none` with an empty synthetic camera configuration." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 5
+          done
+          docker logs "$container_name" || true
+          echo "Synthetic service did not become ready within four minutes." >&2
+          exit 1
 
       - name: Publish the unique experimental tag and verify public visibility
         id: publish
