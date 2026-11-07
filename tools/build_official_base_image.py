@@ -136,15 +136,18 @@ def _duration(value: int, key: str) -> str:
     return f"{value}ns"
 
 
-def docker_import_changes(config: dict[str, Any], labels: dict[str, str]) -> list[str]:
+def docker_import_changes(config: dict[str, Any], labels: dict[str, str], *, image_os: str) -> list[str]:
+    if image_os != "linux":
+        fail(f"rootfs import only supports a verified Linux base image, got {image_os!r}")
     if config.get("Volumes"):
         fail("the official image declares volumes; docker export cannot prove their mounted contents")
     if config.get("OnBuild"):
         fail("cannot preserve non-empty image OnBuild metadata through docker import")
     if config.get("Shell"):
         fail("cannot preserve a custom image Shell through docker import")
-    if config.get("ArgsEscaped"):
-        fail("cannot preserve ArgsEscaped metadata through docker import")
+    # OCI/Moby define ArgsEscaped as a legacy Windows command-line flag. For a
+    # pinned Linux image, preserve the exec-form Entrypoint/Cmd arrays instead;
+    # the flag has no Linux runtime meaning and docker import cannot encode it.
     for key in ("AttachStdin", "AttachStdout", "AttachStderr", "Tty", "OpenStdin", "StdinOnce"):
         if config.get(key) not in (None, False):
             fail(f"unsupported non-default Docker image setting: {key}")
@@ -333,7 +336,7 @@ def build_image(args: argparse.Namespace) -> None:
         "io.ha-recording-control.native-recovery-enabled": "false",
     }
     labels.update(pinned_patch_labels(verification))
-    changes = docker_import_changes(base_config, labels)
+    changes = docker_import_changes(base_config, labels, image_os=base_image["Os"])
     changes_json = json.dumps(changes, ensure_ascii=False, indent=2)
     (temp_root / "docker-import-changes.json").write_text(changes_json, encoding="utf-8")
 

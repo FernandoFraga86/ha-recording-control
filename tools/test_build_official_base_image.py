@@ -115,6 +115,7 @@ class OfficialImageBuildTests(unittest.TestCase):
         instructions = docker_import_changes(
             config,
             {"org.opencontainers.image.title": "HA Recording Control"},
+            image_os="linux",
         )
         self.assertIn('ENTRYPOINT ["/init"]', instructions)
         self.assertIn('WORKDIR "/opt/frigate/"', instructions)
@@ -124,10 +125,20 @@ class OfficialImageBuildTests(unittest.TestCase):
         self.assertIn('LABEL org.example.base="upstream"', instructions)
         self.assertIn('LABEL org.opencontainers.image.title="HA Recording Control"', instructions)
 
+    def test_linux_import_omits_windows_only_args_escaped_but_preserves_commands(self) -> None:
+        config = {"ArgsEscaped": True, "Entrypoint": ["/init"], "Cmd": ["python", "-m", "frigate"]}
+        instructions = docker_import_changes(config, {}, image_os="linux")
+        self.assertIn('ENTRYPOINT ["/init"]', instructions)
+        self.assertIn('CMD ["python", "-m", "frigate"]', instructions)
+
+    def test_rootfs_import_rejects_non_linux_platform(self) -> None:
+        with self.assertRaises(SystemExit):
+            docker_import_changes({"ArgsEscaped": True}, {}, image_os="windows")
+
     def test_export_with_declared_volume_fails_closed(self) -> None:
         config = {"Volumes": {"/media/frigate": {}}}
         with self.assertRaises(SystemExit):
-            docker_import_changes(config, {})
+            docker_import_changes(config, {}, image_os="linux")
 
 
 if __name__ == "__main__":
