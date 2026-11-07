@@ -13,7 +13,10 @@ import tempfile
 import time
 from typing import Any
 
-from tools.integrated_lab.frigate_version import parse_frigate_version
+try:
+    from tools.integrated_lab.frigate_version import parse_frigate_version
+except ModuleNotFoundError:  # Script entry point places tools/ rather than the repo root on sys.path.
+    from integrated_lab.frigate_version import parse_frigate_version
 
 
 ROOT = Path(__file__).resolve().parents[1]
