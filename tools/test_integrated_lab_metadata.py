@@ -35,6 +35,12 @@ class IntegratedLabMetadataTests(unittest.TestCase):
         self.assertIsNone(inspect_optional("container", "lab-only"))
 
     @patch("tools.integrated_service_lab.subprocess.run")
+    def test_cleanup_inspection_treats_a_missing_network_as_absent(self, run) -> None:
+        run.return_value.returncode = 1
+        run.return_value.stdout = "Error response from daemon: network lab-only not found"
+        self.assertIsNone(inspect_optional("network", "lab-only"))
+
+    @patch("tools.integrated_service_lab.subprocess.run")
     def test_cleanup_inspection_fails_closed_on_unrecognized_inspect_error(self, run) -> None:
         run.return_value.returncode = 1
         run.return_value.stdout = "Docker daemon unavailable"
@@ -121,6 +127,11 @@ class IntegratedLabMetadataTests(unittest.TestCase):
         self.assertIn("record:\\n", runner)
         self.assertIn("  enabled: false\\n", runner)
         self.assertNotIn('"ports",', runner)
+
+        smoke = (ROOT / "tools" / "integrated_lab" / "ha_mqtt_smoke.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('BASE + "/api/"', smoke)
 
 
 if __name__ == "__main__":

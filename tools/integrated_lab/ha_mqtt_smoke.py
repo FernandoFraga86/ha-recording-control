@@ -102,7 +102,7 @@ async def main(run_id: str) -> None:
         token = str(token_result["access_token"])
 
         CURRENT_STEP = "verify_authenticated_core_api"
-        status, api_health = await request_json(session, "GET", BASE + "/api", token=token)
+        status, api_health = await request_json(session, "GET", BASE + "/api/", token=token)
         if status != 200 or not isinstance(api_health, dict) or api_health.get("message") != "API running.":
             if isinstance(api_health, dict):
                 keys = ",".join(sorted(str(key) for key in api_health.keys())[:12])

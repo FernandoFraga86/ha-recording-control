@@ -202,7 +202,13 @@ def inspect_optional(kind: str, name: str) -> dict[str, Any] | None:
     )
     output = result.stdout or ""
     if result.returncode != 0:
-        if "No such container" in output or "No such object" in output or "No such network" in output:
+        missing_container = kind == "container" and (
+            "No such container" in output or "No such object" in output
+        )
+        missing_network = kind == "network" and (
+            "No such network" in output or "No such object" in output or f"network {name} not found" in output
+        )
+        if missing_container or missing_network:
             return None
         raise RuntimeError(f"could not inspect lab {kind} {name}: {output[-500:]}")
     inspected = json.loads(output)
