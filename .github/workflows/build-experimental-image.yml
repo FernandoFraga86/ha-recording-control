@@ -97,6 +97,19 @@ jobs:
         working-directory: upstream/web
         run: npx playwright install --with-deps chromium
 
+      - name: Preserve production UI and build the E2E-root variant
+        working-directory: upstream/web
+        shell: bash
+        run: |
+          set -euo pipefail
+          production_web="$RUNNER_TEMP/ha-recording-control-production-web"
+          if [[ -e "$production_web" ]]; then
+            echo "Unexpected existing production UI snapshot path: $production_web" >&2
+            exit 1
+          fi
+          cp -a dist "$production_web"
+          npm run e2e:build
+
       - name: Execute Playwright E2E suite on desktop and mobile projects
         working-directory: upstream/web
         env:
@@ -106,7 +119,7 @@ jobs:
       - name: Verify compiled UI assets
         run: >-
           python3 distribution/tools/prepare_and_verify.py verify-built-web
-          --built-web upstream/web/dist
+          --built-web "$RUNNER_TEMP/ha-recording-control-production-web"
           --distribution distribution
 
       - name: Build the linux/amd64 image locally on the free runner
