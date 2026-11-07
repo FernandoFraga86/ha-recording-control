@@ -1,3 +1,4 @@
+import gzip
 import hashlib
 import importlib.util
 import io
@@ -31,11 +32,89 @@ def tar_bytes(files: dict[str, bytes]) -> bytes:
             layer.addfile(info, io.BytesIO(content))
 
     layer_bytes = layer_stream.getvalue()
+    layer_name = "sha256-test/layer.tar"
+    config_name = "sha256-test/config.json"
+    docker_manifest = json.dumps(
+        [{"Config": config_name, "RepoTags": ["synthetic:test"], "Layers": [layer_name]}]
+    ).encode("utf-8")
     image_stream = io.BytesIO()
     with tarfile.open(fileobj=image_stream, mode="w") as image:
-        info = tarfile.TarInfo("sha256-test/layer.tar")
-        info.size = len(layer_bytes)
-        image.addfile(info, io.BytesIO(layer_bytes))
+        for name, content in {
+            "manifest.json": docker_manifest,
+            config_name: b"{}",
+            layer_name: layer_bytes,
+        }.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            image.addfile(info, io.BytesIO(content))
+    return image_stream.getvalue()
+
+
+def oci_tar_bytes(
+    files: dict[str, bytes],
+    *,
+    layer_descriptor_digest: str | None = None,
+    compress_layer: bool = False,
+) -> bytes:
+    layer_stream = io.BytesIO()
+    with tarfile.open(fileobj=layer_stream, mode="w") as layer:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            layer.addfile(info, io.BytesIO(content))
+
+    layer_bytes = layer_stream.getvalue()
+    if compress_layer:
+        layer_bytes = gzip.compress(layer_bytes, mtime=0)
+    config_bytes = b'{"architecture":"amd64","os":"linux"}'
+    layer_digest = hashlib.sha256(layer_bytes).hexdigest()
+    config_digest = hashlib.sha256(config_bytes).hexdigest()
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": f"sha256:{config_digest}",
+            "size": len(config_bytes),
+        },
+        "layers": [
+            {
+                "mediaType": (
+                    "application/vnd.oci.image.layer.v1.tar+gzip"
+                    if compress_layer
+                    else "application/vnd.oci.image.layer.v1.tar"
+                ),
+                "digest": f"sha256:{layer_descriptor_digest or layer_digest}",
+                "size": len(layer_bytes),
+            }
+        ],
+    }
+    manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+    index = {
+        "schemaVersion": 2,
+        "manifests": [
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": f"sha256:{manifest_digest}",
+                "size": len(manifest_bytes),
+                "platform": {"architecture": "amd64", "os": "linux"},
+            }
+        ],
+    }
+    outer_members = {
+        "oci-layout": b'{"imageLayoutVersion":"1.0.0"}',
+        "index.json": json.dumps(index, separators=(",", ":")).encode("utf-8"),
+        f"blobs/sha256/{manifest_digest}": manifest_bytes,
+        f"blobs/sha256/{config_digest}": config_bytes,
+        f"blobs/sha256/{layer_digest}": layer_bytes,
+    }
+    image_stream = io.BytesIO()
+    with tarfile.open(fileobj=image_stream, mode="w") as image:
+        for name, content in outer_members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            image.addfile(info, io.BytesIO(content))
     return image_stream.getvalue()
 
 
@@ -177,6 +256,34 @@ class DistributionVerificationTests(unittest.TestCase):
         )
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.run_layer_check(archive, distribution)
+
+    def test_oci_image_layout_layers_are_scanned_and_referenced_by_digest(self) -> None:
+        self.run_layer_check(
+            oci_tar_bytes({"opt/frigate/web/images/ha-recording-control.svg": b"<svg/>"})
+        )
+
+    def test_oci_gzip_compressed_layers_are_scanned(self) -> None:
+        self.run_layer_check(
+            oci_tar_bytes(
+                {"opt/frigate/web/images/ha-recording-control.svg": b"<svg/>"},
+                compress_layer=True,
+            )
+        )
+
+    def test_oci_image_layout_rejects_a_missing_referenced_layer(self) -> None:
+        archive = oci_tar_bytes(
+            {"opt/frigate/web/images/ha-recording-control.svg": b"<svg/>"},
+            layer_descriptor_digest="0" * 64,
+        )
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.run_layer_check(archive)
+
+    def test_oci_image_layout_rejects_brand_asset_in_a_layer(self) -> None:
+        archive = oci_tar_bytes(
+            {"opt/frigate/web/images/branding/favicon.svg": b"<svg/>"}
+        )
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.run_layer_check(archive)
 
     def test_distribution_build_source_patch_is_locked_and_applies_narrowly(self) -> None:
         lock = json.loads(

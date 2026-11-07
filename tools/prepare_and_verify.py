@@ -6,10 +6,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import tarfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NoReturn
 
 
@@ -294,42 +295,225 @@ def verify_image_layers(args: argparse.Namespace) -> None:
     image_extensions = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".webp"}
     layer_count = 0
     image_file_count = 0
+    legacy_layer_names: set[str] = set()
+    blob_records: dict[str, dict[str, object]] = {}
+    legacy_manifest: object | None = None
+    oci_layout: object | None = None
+    oci_index: object | None = None
+
+    def inspect_layer(layer_stream: object, label: str) -> None:
+        nonlocal image_file_count
+        try:
+            with tarfile.open(fileobj=layer_stream, mode="r|*") as layer:  # type: ignore[arg-type]
+                for member in layer:
+                    raw_name = member.name.replace("\\", "/")
+                    path = PurePosixPath(raw_name)
+                    if ".." in path.parts:
+                        fail(f"parent traversal in image layer {label}: {raw_name}")
+                    normalized = path.as_posix().lstrip("/").lstrip("./")
+                    if any(
+                        normalized == forbidden
+                        or normalized.endswith("/" + forbidden)
+                        for forbidden in forbidden_paths
+                    ):
+                        fail(f"removed brand asset path exists in image layer: {normalized}")
+
+                    if not member.isfile() or Path(normalized).suffix.lower() not in image_extensions:
+                        continue
+                    stream = layer.extractfile(member)
+                    if stream is None:
+                        fail(f"could not read image asset in layer {label}: {normalized}")
+                    digest = hashlib.sha256()
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(block)
+                    image_file_count += 1
+                    if digest.hexdigest() in forbidden_hashes:
+                        fail(f"upstream protected visual asset bytes found in layer: {normalized}")
+        except (tarfile.TarError, OSError) as exc:
+            fail(f"image layer could not be completely inspected ({label}): {exc}")
+
+    def read_small_json(stream: object, size: int, label: str) -> object:
+        if size > 16 * 1024 * 1024:
+            fail(f"image metadata exceeds the inspection limit: {label}")
+        data = stream.read(size)  # type: ignore[attr-defined]
+        if len(data) != size:
+            fail(f"truncated image metadata: {label}")
+        try:
+            return json.loads(data)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            fail(f"invalid image JSON metadata {label}: {exc}")
+
+    class DigestingReader:
+        def __init__(self, stream: object, prefix: bytes) -> None:
+            self.stream = stream
+            self.prefix = prefix
+            self.digest = hashlib.sha256()
+            self.bytes_read = 0
+
+        def read(self, size: int = -1) -> bytes:
+            if size is None or size < 0:
+                prefix = self.prefix
+                self.prefix = b""
+                data = prefix + self.stream.read()  # type: ignore[attr-defined]
+            elif self.prefix:
+                prefix = self.prefix[:size]
+                self.prefix = self.prefix[len(prefix):]
+                rest = self.stream.read(size - len(prefix)) if len(prefix) < size else b""  # type: ignore[attr-defined]
+                data = prefix + rest
+            else:
+                data = self.stream.read(size)  # type: ignore[attr-defined]
+            self.digest.update(data)
+            self.bytes_read += len(data)
+            return data
+
+    max_metadata_bytes = 16 * 1024 * 1024
 
     try:
         with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as image_archive:
             for outer_member in image_archive:
-                if not outer_member.isfile() or not outer_member.name.endswith("/layer.tar"):
+                if not outer_member.isfile():
                     continue
-                layer_stream = image_archive.extractfile(outer_member)
-                if layer_stream is None:
-                    fail(f"could not read image layer {outer_member.name}")
-                layer_count += 1
-                with tarfile.open(fileobj=layer_stream, mode="r|*") as layer:
-                    for member in layer:
-                        normalized = member.name.replace("\\", "/").lstrip("./")
-                        if any(
-                            normalized == forbidden
-                            or normalized.endswith("/" + forbidden)
-                            for forbidden in forbidden_paths
-                        ):
-                            fail(f"removed brand asset path exists in image layer: {normalized}")
+                name = outer_member.name.replace("\\", "/").lstrip("./")
+                stream = image_archive.extractfile(outer_member)
+                if stream is None:
+                    fail(f"could not read image archive member: {name}")
 
-                        if not member.isfile() or Path(normalized).suffix.lower() not in image_extensions:
-                            continue
-                        stream = layer.extractfile(member)
-                        if stream is None:
-                            fail(f"could not read image asset in layer: {normalized}")
-                        digest = hashlib.sha256()
-                        for block in iter(lambda: stream.read(1024 * 1024), b""):
-                            digest.update(block)
-                        image_file_count += 1
-                        if digest.hexdigest() in forbidden_hashes:
-                            fail(f"upstream protected visual asset bytes found in layer: {normalized}")
+                if name == "manifest.json":
+                    legacy_manifest = read_small_json(stream, outer_member.size, name)
+                    continue
+                if name == "oci-layout":
+                    oci_layout = read_small_json(stream, outer_member.size, name)
+                    continue
+                if name == "index.json":
+                    oci_index = read_small_json(stream, outer_member.size, name)
+                    continue
+                if name.endswith("/layer.tar"):
+                    inspect_layer(stream, name)
+                    layer_count += 1
+                    legacy_layer_names.add(name)
+                    continue
+
+                blob_prefix = "blobs/sha256/"
+                if not name.startswith(blob_prefix):
+                    continue
+                blob_digest = name.removeprefix(blob_prefix)
+                if re.fullmatch(r"[0-9a-f]{64}", blob_digest) is None:
+                    fail(f"malformed OCI SHA-256 blob path: {name}")
+                prefix = stream.read(128)
+                if prefix.lstrip().startswith((b"{", b"[")):
+                    if outer_member.size > max_metadata_bytes:
+                        fail(f"OCI JSON blob exceeds the inspection limit: {name}")
+                    data = prefix + stream.read(outer_member.size - len(prefix))
+                    if len(data) != outer_member.size:
+                        fail(f"truncated OCI JSON blob: {name}")
+                    actual_digest = hashlib.sha256(data).hexdigest()
+                    if actual_digest != blob_digest:
+                        fail(f"OCI metadata blob digest mismatch: {name}")
+                    try:
+                        value = json.loads(data)
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        fail(f"invalid OCI JSON blob {name}: {exc}")
+                    blob_records[blob_digest] = {"kind": "json", "size": len(data), "json": value}
+                    continue
+
+                reader = DigestingReader(stream, prefix)
+                inspect_layer(reader, name)
+                while reader.read(1024 * 1024):
+                    pass
+                if reader.bytes_read != outer_member.size:
+                    fail(
+                        f"truncated OCI layer blob: {name} "
+                        f"({reader.bytes_read} of {outer_member.size} bytes read)"
+                    )
+                actual_digest = reader.digest.hexdigest()
+                if actual_digest != blob_digest:
+                    fail(f"OCI layer blob digest mismatch: {name}")
+                blob_records[blob_digest] = {"kind": "layer", "size": reader.bytes_read}
+                layer_count += 1
     except (tarfile.TarError, OSError) as exc:
         fail(f"Docker save archive could not be completely inspected: {exc}")
 
     if layer_count == 0:
         fail("Docker save stream contained no image layers")
+
+    archive_formats = 0
+    if legacy_manifest is not None:
+        if not isinstance(legacy_manifest, list) or not legacy_manifest:
+            fail("Docker image manifest.json is empty or malformed")
+        for image in legacy_manifest:
+            layers = image.get("Layers") if isinstance(image, dict) else None
+            if not isinstance(layers, list) or not layers:
+                fail("Docker image manifest does not enumerate its filesystem layers")
+            missing_layers = set(layers) - legacy_layer_names
+            if missing_layers:
+                fail(f"Docker image manifest references missing layers: {sorted(missing_layers)}")
+        archive_formats += 1
+
+    if oci_layout is not None or oci_index is not None:
+        if not isinstance(oci_layout, dict) or oci_layout.get("imageLayoutVersion") != "1.0.0":
+            fail("OCI image layout marker is missing or unsupported")
+        if not isinstance(oci_index, dict) or oci_index.get("schemaVersion") != 2:
+            fail("OCI image index is missing or malformed")
+        top_descriptors = oci_index.get("manifests")
+        if not isinstance(top_descriptors, list) or not top_descriptors:
+            fail("OCI image index contains no image manifests")
+
+        seen_manifests: set[str] = set()
+        referenced_layers: set[str] = set()
+
+        def resolve_blob(descriptor: object, label: str) -> tuple[str, dict[str, object]]:
+            if not isinstance(descriptor, dict):
+                fail(f"malformed OCI descriptor: {label}")
+            digest = descriptor.get("digest")
+            size = descriptor.get("size")
+            if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                fail(f"unsupported OCI descriptor digest: {label}")
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                fail(f"invalid OCI descriptor size: {label}")
+            hex_digest = digest.removeprefix("sha256:")
+            record = blob_records.get(hex_digest)
+            if record is None or record.get("size") != size:
+                fail(f"OCI descriptor references absent or size-mismatched blob: {label}")
+            return hex_digest, record
+
+        def visit_manifest(descriptor: object) -> None:
+            manifest_digest, record = resolve_blob(descriptor, "image manifest")
+            if manifest_digest in seen_manifests:
+                return
+            seen_manifests.add(manifest_digest)
+            if record.get("kind") != "json" or not isinstance(record.get("json"), dict):
+                fail("OCI image manifest blob is not JSON")
+            manifest = record["json"]
+            if manifest.get("schemaVersion") != 2:
+                fail("OCI image manifest schema version is unsupported")
+            nested_manifests = manifest.get("manifests")
+            if nested_manifests is not None:
+                if not isinstance(nested_manifests, list) or not nested_manifests:
+                    fail("nested OCI index contains no manifests")
+                for nested in nested_manifests:
+                    visit_manifest(nested)
+                return
+            config = manifest.get("config")
+            _, config_record = resolve_blob(config, "image config")
+            if config_record.get("kind") != "json" or not isinstance(config_record.get("json"), dict):
+                fail("OCI image config is not JSON")
+            layers = manifest.get("layers")
+            if not isinstance(layers, list) or not layers:
+                fail("OCI image manifest contains no filesystem layers")
+            for layer_descriptor in layers:
+                layer_digest, layer_record = resolve_blob(layer_descriptor, "filesystem layer")
+                if layer_record.get("kind") != "layer":
+                    fail("OCI filesystem layer was not inspected as a tar archive")
+                referenced_layers.add(layer_digest)
+
+        for descriptor in top_descriptors:
+            visit_manifest(descriptor)
+        if not referenced_layers:
+            fail("OCI image index references no inspected filesystem layers")
+        archive_formats += 1
+
+    if archive_formats == 0:
+        fail("Docker save archive contains no recognized image manifest")
 
     print(
         json.dumps(
@@ -337,6 +521,7 @@ def verify_image_layers(args: argparse.Namespace) -> None:
                 "status": "PASS",
                 "layers_inspected": layer_count,
                 "image_files_hashed": image_file_count,
+                "archive_formats_verified": archive_formats,
                 "upstream_brand_asset_hashes_checked": len(forbidden_hashes),
                 "removed_brand_asset_paths_absent": True,
             },

@@ -30,6 +30,8 @@ The app templates deliberately retain the `.template` suffix. This repository ha
 
 The version tag is unique to this rebrand variant. The registry tag must be checked as unused immediately before publication, and the OCI digest recorded after publication. Registry-level immutable-tag policy is not assumed. The app remains non-installable until a separate review validates the complete app with the target Supervisor.
 
+Run `42415911279` passed the source and UI gates, Playwright, flattened rootfs build, generated `frigate/version.py` hash verification, the packaged API tests (5 passed), and the Nginx secure-token module check. It then stopped before smoke or publication because the image-layer scanner found no legacy `*/layer.tar` entries in `docker save` output. The scanner now handles both legacy Docker archives and OCI layouts, verifies OCI index/manifest descriptors and blob digests, and scans referenced layer contents including gzip-compressed layers. Local synthetic archive tests cover both formats; a new GitHub Actions run must validate the real runner's archive format. No image has been published and no OCI digest is claimed.
+
 The app template remains `config.yaml.template`; no root `repository.yaml` or discoverable `config.yaml` is added. `production_ready=false`, `installable=false`, and `native_recovery_enabled=false` remain explicit.
 
 ## Trademark and attribution
