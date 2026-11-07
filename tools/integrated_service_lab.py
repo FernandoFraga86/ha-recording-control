@@ -135,6 +135,39 @@ def write_lab_configs(root: Path, run_id: str) -> tuple[Path, Path, Path]:
     return broker_dir, ha_dir, frigate_dir
 
 
+def validate_runner_temp_root(root: Path, root_base: Path) -> Path:
+    if root.is_symlink():
+        raise RuntimeError("refusing to clean a symlink as the temporary lab root")
+    if not root.exists():
+        raise RuntimeError("refusing to clean a missing temporary lab root")
+    resolved_base = root_base.resolve(strict=True)
+    resolved_root = root.resolve(strict=True)
+    if (
+        resolved_root.parent != resolved_base
+        or not resolved_root.name.startswith("ha-rc-integrated-lab-")
+        or not resolved_root.is_dir()
+    ):
+        raise RuntimeError("refusing to clean a path outside this run's designated temporary lab root")
+    return resolved_root
+
+
+def remove_runner_temp_root(root: Path, root_base: Path) -> None:
+    """Reclaim container-created files only inside this run's checked temp directory."""
+    resolved_root = validate_runner_temp_root(root, root_base)
+    if sys.platform != "linux" or not hasattr(os, "getuid") or not shutil.which("sudo"):
+        raise RuntimeError("cannot safely reclaim container-owned temporary files on this runner")
+
+    owner = f"{os.getuid()}:{os.getgid()}"
+    for command in (
+        ["sudo", "chown", "--recursive", "--no-dereference", "--preserve-root", "--", owner, str(resolved_root)],
+        ["sudo", "chmod", "--recursive", "u+rwX", "--", str(resolved_root)],
+    ):
+        result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            raise RuntimeError("could not reclaim permissions in the checked runner temporary directory")
+    shutil.rmtree(resolved_root)
+
+
 def inspect_container(name: str) -> dict[str, Any]:
     result = docker("inspect", name, capture=True)
     return json.loads(result)[0]
@@ -429,12 +462,21 @@ def run_lab() -> None:
                 print(f"Recent logs from {name} before cleanup:\n{logs[-5000:]}", file=sys.stderr)
         raise
     finally:
+        cleanup_failure: Exception | None = None
         try:
             cleanup_errors = stop_and_remove(names, network, require_clean=success)
             if cleanup_errors:
                 print("Cleanup warnings: " + "; ".join(cleanup_errors), file=sys.stderr)
-        finally:
-            shutil.rmtree(root)
+        except Exception as error:
+            cleanup_failure = error
+        try:
+            remove_runner_temp_root(root, root_base)
+        except Exception as error:
+            cleanup_failure = cleanup_failure or error
+        if cleanup_failure is not None:
+            if success:
+                raise cleanup_failure
+            print(f"Temporary lab cleanup warning: {type(cleanup_failure).__name__}: {cleanup_failure}", file=sys.stderr)
 
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:

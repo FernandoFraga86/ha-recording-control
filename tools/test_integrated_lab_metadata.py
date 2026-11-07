@@ -5,13 +5,28 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import tempfile
 import unittest
+
+from tools.integrated_service_lab import validate_runner_temp_root
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class IntegratedLabMetadataTests(unittest.TestCase):
+    def test_temp_cleanup_accepts_only_a_direct_child_with_the_run_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            valid = base / "ha-rc-integrated-lab-test"
+            valid.mkdir()
+            self.assertEqual(validate_runner_temp_root(valid, base), valid.resolve())
+
+            with self.assertRaises(RuntimeError):
+                validate_runner_temp_root(base, base)
+            with self.assertRaises(RuntimeError):
+                validate_runner_temp_root(base / "unrelated", base)
+
     def test_published_artifact_metadata_is_synchronized_and_non_installable(self) -> None:
         lock = json.loads((ROOT / "distribution-lock.json").read_text(encoding="utf-8"))
         provenance = json.loads((ROOT / "SOURCE-PROVENANCE.json").read_text(encoding="utf-8"))
