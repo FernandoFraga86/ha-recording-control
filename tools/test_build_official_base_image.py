@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -11,6 +14,7 @@ from build_official_base_image import (
     pinned_upstream_commit,
     verify_oci_index,
     verify_oci_manifest,
+    verify_python_tree_matches_commit,
 )
 
 
@@ -139,6 +143,80 @@ class OfficialImageBuildTests(unittest.TestCase):
         config = {"Volumes": {"/media/frigate": {}}}
         with self.assertRaises(SystemExit):
             docker_import_changes(config, {}, image_os="linux")
+
+    def _create_upstream_fixture(self, root: Path) -> tuple[Path, str]:
+        upstream = root / "upstream"
+        upstream.mkdir()
+        (upstream / "frigate").mkdir()
+        (upstream / "frigate" / "__init__.py").write_bytes(b"# pinned source\n")
+        (upstream / "Makefile").write_text(
+            'VERSION = 0.18.2\n'
+            'COMMIT_HASH := $(shell git log -1 --pretty=format:"%h"|tail -1)\n'
+            'version:\n'
+            '\techo \'VERSION = "$(VERSION)-$(COMMIT_HASH)"\' > frigate/version.py\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", str(upstream)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(upstream), "config", "core.autocrlf", "false"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(upstream), "add", "."], check=True, capture_output=True)
+        env = os.environ.copy()
+        env.setdefault("GIT_AUTHOR_NAME", "Offline Test")
+        env.setdefault("GIT_AUTHOR_EMAIL", "offline-test@example.invalid")
+        env.setdefault("GIT_COMMITTER_NAME", "Offline Test")
+        env.setdefault("GIT_COMMITTER_EMAIL", "offline-test@example.invalid")
+        subprocess.run(
+            ["git", "-C", str(upstream), "commit", "-m", "fixture"],
+            check=True,
+            capture_output=True,
+            env=env,
+        )
+        pinned_commit = subprocess.run(
+            ["git", "-C", str(upstream), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        return upstream, pinned_commit
+
+    def test_generated_upstream_version_file_is_verified_against_pinned_recipe(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ha-version-source-") as temp_dir:
+            root = Path(temp_dir)
+            upstream, pinned_commit = self._create_upstream_fixture(root)
+            copied = root / "copied"
+            copied.mkdir()
+            (copied / "__init__.py").write_bytes(b"# pinned source\n")
+            short_hash = subprocess.run(
+                ["git", "-C", str(upstream), "log", "-1", "--pretty=format:%h"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            (copied / "version.py").write_bytes(
+                f'VERSION = "0.18.2-{short_hash}"\n'.encode("utf-8")
+            )
+
+            self.assertEqual(
+                verify_python_tree_matches_commit(upstream, copied, pinned_commit),
+                (1, True),
+            )
+
+    def test_generated_upstream_version_file_rejects_mismatched_version_or_commit(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ha-version-mismatch-") as temp_dir:
+            root = Path(temp_dir)
+            upstream, pinned_commit = self._create_upstream_fixture(root)
+            copied = root / "copied"
+            copied.mkdir()
+            (copied / "__init__.py").write_bytes(b"# pinned source\n")
+            (copied / "version.py").write_text('VERSION = "0.18.2-wrong"\n', encoding="utf-8")
+
+            with self.assertRaises(SystemExit):
+                verify_python_tree_matches_commit(upstream, copied, pinned_commit)
+            with self.assertRaises(SystemExit):
+                verify_python_tree_matches_commit(upstream, copied, "0" * 40)
 
 
 if __name__ == "__main__":

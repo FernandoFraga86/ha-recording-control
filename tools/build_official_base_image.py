@@ -244,9 +244,43 @@ def _canonical_config(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def verify_python_tree_matches_commit(upstream: Path, copied_source: Path) -> int:
+def generated_upstream_version_file(upstream: Path, pinned_commit: str) -> bytes:
+    makefile_path = upstream / "Makefile"
+    if not makefile_path.is_file():
+        fail("pinned upstream Makefile is missing; cannot validate its generated version file")
+    makefile = makefile_path.read_text(encoding="utf-8")
+    version_match = re.search(r"^VERSION\s*=\s*([0-9]+\.[0-9]+\.[0-9]+)\s*$", makefile, re.MULTILINE)
+    if not version_match:
+        fail("pinned upstream Makefile has no supported VERSION assignment")
+    if not re.search(
+        r'^\s*COMMIT_HASH\s*:=\s*\$\(shell\s+git\s+log\s+-1\s+--pretty=format:"%h"\|tail\s+-1\)\s*$',
+        makefile,
+        re.MULTILINE,
+    ) or not re.search(
+        r'^\s*echo\s+\'VERSION\s*=\s*"\$\(VERSION\)-\$\(COMMIT_HASH\)"\'\s*>\s*frigate/version\.py\s*$',
+        makefile,
+        re.MULTILINE,
+    ):
+        fail("pinned upstream Makefile does not match the expected generated frigate/version.py recipe")
+    head = run(["git", "-C", str(upstream), "rev-parse", "HEAD"], capture=True).strip()
+    if head != pinned_commit:
+        fail("upstream checkout HEAD differs from the pinned verification commit")
+    short_hash = run(["git", "-C", str(upstream), "log", "-1", "--pretty=format:%h"], capture=True).strip()
+    if not re.fullmatch(r"[0-9a-f]{7,40}", short_hash) or not pinned_commit.startswith(short_hash):
+        fail("could not derive the pinned commit abbreviation used by the upstream version recipe")
+    return f'VERSION = "{version_match.group(1)}-{short_hash}"\n'.encode("utf-8")
+
+
+def verify_python_tree_matches_commit(
+    upstream: Path,
+    copied_source: Path,
+    pinned_commit: str,
+) -> tuple[int, bool]:
+    head = run(["git", "-C", str(upstream), "rev-parse", "HEAD"], capture=True).strip()
+    if head != pinned_commit:
+        fail("upstream checkout HEAD differs from the pinned verification commit")
     archive = subprocess.run(
-        ["git", "-C", str(upstream), "archive", "--format=tar", "HEAD", "frigate"],
+        ["git", "-C", str(upstream), "archive", "--format=tar", pinned_commit, "frigate"],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -264,15 +298,28 @@ def verify_python_tree_matches_commit(upstream: Path, copied_source: Path) -> in
                 fail(f"cannot read pinned upstream source file: {name}")
             expected[name.removeprefix("frigate/")] = stream.read()
     actual_paths = {path.relative_to(copied_source).as_posix() for path in copied_source.rglob("*.py")}
-    if actual_paths != set(expected):
-        missing = sorted(set(expected) - actual_paths)[:10]
-        extra = sorted(actual_paths - set(expected))[:10]
+    generated_version_verified = False
+    expected_paths = set(expected)
+    if "version.py" not in expected_paths:
+        if actual_paths == expected_paths | {"version.py"}:
+            actual_version = (copied_source / "version.py").read_bytes()
+            expected_version = generated_upstream_version_file(upstream, pinned_commit)
+            if actual_version != expected_version:
+                fail("official image frigate/version.py does not match the pinned upstream Makefile recipe")
+            generated_version_verified = True
+        else:
+            missing = sorted(expected_paths - actual_paths)[:10]
+            extra = sorted(actual_paths - expected_paths)[:10]
+            fail(f"official image Python source tree differs from pinned commit; missing={missing}, extra={extra}")
+    elif actual_paths != expected_paths:
+        missing = sorted(expected_paths - actual_paths)[:10]
+        extra = sorted(actual_paths - expected_paths)[:10]
         fail(f"official image Python source tree differs from pinned commit; missing={missing}, extra={extra}")
     for relative, expected_bytes in expected.items():
         actual_bytes = (copied_source / relative).read_bytes()
         if actual_bytes != expected_bytes:
             fail(f"official image source does not match pinned upstream commit: frigate/{relative}")
-    return len(expected)
+    return len(expected), generated_version_verified
 
 
 def _inspect_image(reference: str) -> dict[str, Any]:
@@ -348,7 +395,11 @@ def build_image(args: argparse.Namespace) -> None:
     try:
         # Copy the image's unmodified Python tree before the filesystem export.
         run(["docker", "cp", f"{container_id}:/opt/frigate/frigate/.", str(copied_source)])
-        source_count = verify_python_tree_matches_commit(upstream, copied_source)
+        source_count, generated_version_verified = verify_python_tree_matches_commit(
+            upstream,
+            copied_source,
+            upstream_commit,
+        )
 
         export_log = temp_root / "ha-recording-control-docker-export.stderr.log"
         with export_log.open("wb") as stderr_file:
@@ -411,6 +462,7 @@ def build_image(args: argparse.Namespace) -> None:
             "base_platform_manifest_digest": expected_manifest,
             "base_config_digest": expected_config,
             "upstream_python_source_files_verified": source_count,
+            "upstream_generated_version_file_verified": generated_version_verified,
             "rootfs_transformation": repack_stats,
             "rootfs_archive_bytes": archive_path.stat().st_size,
             "rootfs_archive_sha256": file_sha256(archive_path),
