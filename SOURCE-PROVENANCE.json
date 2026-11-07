@@ -31,7 +31,23 @@
     "checksum_reference_commit": "b0b3e488f56e0899977a8e2e184a7338f3f6a2ae",
     "checksum_reference_path": "www/nginx/distinfo",
     "transport": "HTTP FreeBSD backup distfile site; integrity is enforced against the SHA-256 pinned from the FreeBSD Ports commit",
-    "remote_download_hash_verified": false
+    "remote_download_hash_verified": true,
+    "remote_download_hash_verified_run": 42403520281
+  },
+  "secure_token_module_source": {
+    "scope": "required upstream build dependency; no runtime changes",
+    "version": "1.5",
+    "upstream_script": "docker/main/build_nginx.sh",
+    "upstream_url": "https://github.com/kaltura/nginx-secure-token-module/archive/refs/tags/1.5.tar.gz",
+    "remote_build_result": "HTTP 404 in GitHub Actions run 42403520281",
+    "independent_checks": {
+      "github_api_repository": "HTTP 404",
+      "github_archive_tag": "HTTP 404",
+      "github_codeload_tag": "HTTP 404",
+      "freebsd_distcache_candidate": "HTTP 404"
+    },
+    "verified_alternate_source": null,
+    "status": "blocked; no substitute source or hash accepted"
   },
   "candidate_version": "0.18.2-recording-control-1ca90f8-rebrand1",
   "image": {
