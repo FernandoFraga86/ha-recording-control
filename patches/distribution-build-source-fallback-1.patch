@@ -10,7 +10,7 @@ diff --git a/docker/main/build_nginx.sh b/docker/main/build_nginx.sh
 -tar -zxf ${VOD_MODULE_VERSION}.tar.gz -C /tmp/nginx-vod-module --strip-components=1
 -rm ${VOD_MODULE_VERSION}.tar.gz
 +VOD_MODULE_ARCHIVE="kaltura-nginx-vod-module-${VOD_MODULE_VERSION}_GH0.tar.gz"
-+VOD_MODULE_ARCHIVE_URL="https://download.freebsd.org/ports/distfiles/${VOD_MODULE_ARCHIVE}"
++VOD_MODULE_ARCHIVE_URL="http://distcache.FreeBSD.org/ports-distfiles/${VOD_MODULE_ARCHIVE}"
 +VOD_MODULE_ARCHIVE_SHA256="ace04201cf2d2b1a3e5e732a22b92225b8ce61a494df9cc7f79d97efface8952"
 +VOD_MODULE_ARCHIVE_SIZE="470904"
 +wget -nv --output-document="$VOD_MODULE_ARCHIVE" "$VOD_MODULE_ARCHIVE_URL"

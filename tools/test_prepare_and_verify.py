@@ -188,7 +188,7 @@ class DistributionVerificationTests(unittest.TestCase):
             hashlib.sha256(patch_path.read_bytes()).hexdigest(), patch_entry["sha256"]
         )
         patch_text = patch_path.read_text(encoding="utf-8")
-        self.assertIn("https://download.freebsd.org/ports/distfiles/", patch_text)
+        self.assertIn("http://distcache.FreeBSD.org/ports-distfiles/", patch_text)
         self.assertIn(
             'VOD_MODULE_ARCHIVE="kaltura-nginx-vod-module-${VOD_MODULE_VERSION}_GH0.tar.gz"',
             patch_text,
