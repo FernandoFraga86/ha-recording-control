@@ -142,6 +142,11 @@ class SupervisorAppLabTests(unittest.TestCase):
         self.assertIn("/dev/kvm", workflow)
         self.assertIn("40 * 1024 * 1024 * 1024", workflow)
 
+    def test_qemu_guest_reboot_is_not_configured_to_exit_the_vm(self) -> None:
+        source = (ROOT / "tools" / "supervisor_app_lab.py").read_text(encoding="utf-8")
+        self.assertNotIn('"-no-reboot"', source)
+        self.assertIn("console.reboot()", source)
+
     def test_production_template_stays_manual_and_false_gates_are_not_changed(self) -> None:
         template = module.TEMPLATE_PATH.read_text(encoding="utf-8")
         self.assertIn("boot: manual", template)

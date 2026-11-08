@@ -320,7 +320,6 @@ class HAOSConsole:
             "stdio",
             "-monitor",
             "none",
-            "-no-reboot",
         ]
         if variables is None:
             args.extend(["-bios", str(firmware)])
