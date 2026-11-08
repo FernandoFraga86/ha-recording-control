@@ -54,7 +54,7 @@
     "anonymous_manifest_read_http_status": 200
   },
   "integrated_lab": {
-    "status": "pending",
+    "status": "passed_synthetic_integration_only",
     "scope": "synthetic Home Assistant Core, Mosquitto, and Frigate service integration only; no Supervisor installation, household configuration, camera feeds, or physical-device validation",
     "network_policy": "temporary Docker bridge with internal isolation, no published ports, no external container egress",
     "images": {
@@ -74,11 +74,11 @@
         "linux_amd64_digest": "sha256:e024fe700120021c710c08bd28d7e65e5f24442755a0381c028bdf3596ebf7c4"
       }
     },
-    "workflow_run_id": null
+    "workflow_run_id": "42427714912"
   },
   "installable": false,
   "blocking_gates": [
-    "integrated synthetic Core, Mosquitto, and Frigate service test pending",
+    "Supervisor and production validation pending; synthetic Core/Mosquitto/Frigate service test passed in run 42427714912",
     "target Supervisor load/install validation pending",
     "startup recovery and privacy acceptance validation pending",
     "independent backup restore and executable production rollback validation pending"

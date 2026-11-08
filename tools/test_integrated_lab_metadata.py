@@ -136,8 +136,10 @@ class IntegratedLabMetadataTests(unittest.TestCase):
         self.assertEqual(provenance_refs["home_assistant_core_linux_amd64"], refs["HA_IMAGE"])
         self.assertEqual(provenance_refs["mosquitto_linux_amd64"], refs["MOSQUITTO_IMAGE"])
         self.assertEqual(provenance_refs["frigate_experimental_linux_amd64"], refs["FRIGATE_IMAGE"])
-        self.assertEqual(lock["integrated_lab"]["status"], "pending")
-        self.assertEqual(provenance["integrated_lab"]["status"], "pending")
+        self.assertEqual(lock["integrated_lab"]["status"], "passed_synthetic_integration_only")
+        self.assertEqual(provenance["integrated_lab"]["status"], "passed_synthetic_integration_only")
+        self.assertEqual(lock["integrated_lab"]["workflow_run_id"], "42427714912")
+        self.assertEqual(provenance["integrated_lab"]["workflow_run_id"], "42427714912")
 
     def test_workflow_preflights_before_pulls_and_never_publishes_ports_or_images(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "integrated-service-lab.yml").read_text(

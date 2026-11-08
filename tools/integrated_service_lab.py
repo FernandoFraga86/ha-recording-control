@@ -51,8 +51,11 @@ def validate_lock() -> None:
         raise RuntimeError("the candidate readiness gates must remain false")
     if lock.get("native_recovery_enabled") is not False:
         raise RuntimeError("native recovery must remain disabled")
-    if lock.get("integrated_lab", {}).get("status") != "pending":
-        raise RuntimeError("integrated lab must be pending before this run")
+    if lock.get("integrated_lab", {}).get("status") not in {
+        "pending",
+        "passed_synthetic_integration_only",
+    }:
+        raise RuntimeError("integrated lab status is not valid for a synthetic run")
     if lock_image_refs(lock) != EXPECTED_IMAGES:
         raise RuntimeError("digest-pinned image references differ from the reviewed distribution lock")
     for name, ref in EXPECTED_IMAGES.items():
