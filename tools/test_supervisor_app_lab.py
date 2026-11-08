@@ -161,7 +161,7 @@ class SupervisorAppLabTests(unittest.TestCase):
 
     def test_supervisor_ingress_metadata_uses_effective_token_route_without_logging_token(self) -> None:
         info = {
-            "webui": "http://[HOST]:5000/",
+            "webui": "http://[HOST]:None/",
             "ingress_entry": "/api/hassio_ingress/lab-token-placeholder",
             "ingress_url": "/api/hassio_ingress/lab-token-placeholder//",
         }

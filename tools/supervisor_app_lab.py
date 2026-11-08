@@ -729,7 +729,7 @@ def verify_candidate_metadata(console: HAOSConsole, info: dict[str, Any], contai
     if not isinstance(info.get("ingress_url"), str) or not info["ingress_url"]:
         raise LabFailure("Supervisor did not create an ingress route for the running app")
     if not ingress_metadata_valid(info):
-        raise LabFailure("Supervisor app UI/ingress metadata is incomplete")
+        raise LabFailure(f"Supervisor app UI/ingress metadata is incomplete: {ingress_metadata_diagnostics(info)}")
     panel = info.get("ingress_panel")
     if isinstance(panel, dict) and panel.get("admin") is not False:
         raise LabFailure("the lab panel unexpectedly became administrator-only")
@@ -764,11 +764,30 @@ def ingress_metadata_valid(info: dict[str, Any]) -> bool:
     """Validate Supervisor's effective ingress URLs without exposing their token."""
     entry = info.get("ingress_entry")
     url = info.get("ingress_url")
-    if not isinstance(entry, str) or not re.fullmatch(r"/api/hassio_ingress/[^/]+", entry):
-        return False
-    if not isinstance(url, str) or not url.startswith(entry + "/"):
-        return False
-    return info.get("webui") == "http://[HOST]:5000/"
+    entry_match = re.fullmatch(r"/api/hassio_ingress/([^/]+)", entry) if isinstance(entry, str) else None
+    url_match = re.fullmatch(r"/api/hassio_ingress/([^/]+)(?:/.*)?", url) if isinstance(url, str) else None
+    webui = info.get("webui")
+    webui_valid = isinstance(webui, str) and re.fullmatch(
+        r"https?://\[HOST\]:(?:[0-9]+|None)/", webui
+    ) is not None
+    return bool(entry_match and url_match and entry_match.group(1) == url_match.group(1) and webui_valid)
+
+
+def ingress_metadata_diagnostics(info: dict[str, Any]) -> str:
+    """Return token-free shape diagnostics for a failed ingress metadata check."""
+    entry = info.get("ingress_entry")
+    url = info.get("ingress_url")
+    entry_match = re.fullmatch(r"/api/hassio_ingress/([^/]+)", entry) if isinstance(entry, str) else None
+    url_match = re.fullmatch(r"/api/hassio_ingress/([^/]+)(?:/.*)?", url) if isinstance(url, str) else None
+    webui = info.get("webui")
+    webui_valid = isinstance(webui, str) and re.fullmatch(
+        r"https?://\[HOST\]:(?:[0-9]+|None)/", webui
+    ) is not None
+    return (
+        f"entry_path={bool(entry_match)}, url_path={bool(url_match)}, "
+        f"route_token_match={bool(entry_match and url_match and entry_match.group(1) == url_match.group(1))}, "
+        f"webui_shape={webui_valid}"
+    )
 
 
 def app_api_from_core(console: HAOSConsole, container_id: str, root: Path) -> None:
