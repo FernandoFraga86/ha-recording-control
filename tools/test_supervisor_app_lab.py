@@ -17,6 +17,56 @@ SPEC.loader.exec_module(module)
 
 
 class SupervisorAppLabTests(unittest.TestCase):
+    def test_manual_stop_quiescence_requires_successful_job_and_no_live_container(self) -> None:
+        self.assertTrue(module.stop_quiescence_confirmed(
+            stop_job_succeeded=True,
+            supervisor_state="stopped",
+            container_state=None,
+            active_frigate_writers=False,
+        ))
+        self.assertTrue(module.stop_quiescence_confirmed(
+            stop_job_succeeded=True,
+            supervisor_state="error",
+            container_state=None,
+            active_frigate_writers=False,
+        ))
+        self.assertTrue(module.stop_quiescence_confirmed(
+            stop_job_succeeded=True,
+            supervisor_state="error",
+            container_state={"Status": "exited", "ExitCode": 143, "OOMKilled": False, "Error": ""},
+            active_frigate_writers=False,
+        ))
+        self.assertFalse(module.stop_quiescence_confirmed(
+            stop_job_succeeded=False,
+            supervisor_state="error",
+            container_state=None,
+            active_frigate_writers=False,
+        ))
+        self.assertFalse(module.stop_quiescence_confirmed(
+            stop_job_succeeded=True,
+            supervisor_state="error",
+            container_state={"Status": "exited", "ExitCode": 1, "OOMKilled": False, "Error": ""},
+            active_frigate_writers=False,
+        ))
+        self.assertFalse(module.stop_quiescence_confirmed(
+            stop_job_succeeded=True,
+            supervisor_state="error",
+            container_state={"Status": "running", "ExitCode": 0, "OOMKilled": False, "Error": ""},
+            active_frigate_writers=False,
+        ))
+        self.assertFalse(module.stop_quiescence_confirmed(
+            stop_job_succeeded=True,
+            supervisor_state="error",
+            container_state={"Status": "exited", "ExitCode": 143, "OOMKilled": True, "Error": ""},
+            active_frigate_writers=False,
+        ))
+        self.assertFalse(module.stop_quiescence_confirmed(
+            stop_job_succeeded=True,
+            supervisor_state="error",
+            container_state=None,
+            active_frigate_writers=True,
+        ))
+
     def test_guest_write_splits_base64_into_short_independently_decodable_commands(self) -> None:
         class RecordingConsole:
             def __init__(self) -> None:

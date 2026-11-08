@@ -452,6 +452,22 @@ def list_candidate_containers(console: HAOSConsole) -> list[tuple[str, str, str]
     return items
 
 
+def list_candidate_containers_all(console: HAOSConsole) -> list[dict[str, str]]:
+    output = docker_output(
+        console,
+        "docker ps --all --no-trunc --format '{{.ID}}|{{.Image}}|{{.Names}}|{{.State}}'",
+        timeout=30,
+    )
+    items: list[dict[str, str]] = []
+    for line in output.splitlines():
+        fields = line.strip().split("|", 3)
+        if len(fields) != 4 or not re.fullmatch(r"[0-9a-f]{12,64}", fields[0]):
+            continue
+        if fields[1].startswith(GHCR_IMAGE + ":") or fields[1].startswith(OFFICIAL_IMAGE + ":"):
+            items.append({"id": fields[0], "image": fields[1], "name": fields[2].lstrip("/"), "state": fields[3]})
+    return items
+
+
 def assert_single_writer(console: HAOSConsole, expected_image_prefix: str | None) -> tuple[str, str, str] | None:
     writers = list_candidate_containers(console)
     if expected_image_prefix is None:
@@ -462,6 +478,92 @@ def assert_single_writer(console: HAOSConsole, expected_image_prefix: str | None
     if len(writers) != 1 or len(selected) != 1:
         raise LabFailure("the synthetic migration did not maintain exactly one active Frigate writer")
     return selected[0]
+
+
+def stop_quiescence_confirmed(
+    *,
+    stop_job_succeeded: bool,
+    supervisor_state: str,
+    container_state: dict[str, Any] | None,
+    active_frigate_writers: bool,
+) -> bool:
+    """Confirm an acknowledged manual stop without mistaking Supervisor ERROR for a live writer.
+
+    Supervisor 2026.10.5 maps a Docker FAILED event to app state ERROR even
+    after an intentional stop. The caller still has to prove that the exact
+    app container is gone or exited, and that no Frigate image container is
+    running before it can proceed.
+    """
+    if stop_job_succeeded is not True or active_frigate_writers or supervisor_state not in {"stopped", "error"}:
+        return False
+    if container_state is None:
+        return True
+    if container_state.get("Status") != "exited" or container_state.get("OOMKilled") is True:
+        return False
+    if supervisor_state == "stopped":
+        return True
+    return (
+        container_state.get("ExitCode") == 143
+        and not container_state.get("Error")
+    )
+
+
+def wait_for_app_quiesced(
+    console: HAOSConsole,
+    slug: str,
+    stopped_container_id: str,
+    root: Path,
+    *,
+    timeout: int = 300,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    last_state: str | None = None
+    last_container_state: dict[str, Any] | None = None
+    expected_name = f"app_{slug}"
+    while time.monotonic() < deadline:
+        info = cli_info(console, slug)
+        last_state = str(info.get("state"))
+        records = list_candidate_containers_all(console)
+        exact = [item for item in records if item["id"] == stopped_container_id or item["name"] == expected_name]
+        if len(exact) > 1:
+            raise LabFailure(f"multiple Frigate containers matched stopped app {slug}")
+        if exact and exact[0]["id"] != stopped_container_id:
+            raise LabFailure(f"Supervisor replaced the stopped container for {slug}; writer identity changed")
+
+        if exact:
+            last_container_state = inspect_container(console, stopped_container_id).get("State")
+            if not isinstance(last_container_state, dict):
+                raise LabFailure(f"Docker returned no state for stopped app container {slug}")
+        else:
+            last_container_state = None
+
+        active = list_candidate_containers(console)
+        if not active and stop_quiescence_confirmed(
+            stop_job_succeeded=True,
+            supervisor_state=last_state,
+            container_state=last_container_state,
+            active_frigate_writers=bool(active),
+        ):
+            if last_state == "error":
+                detail = (
+                    "container removed by Supervisor"
+                    if last_container_state is None
+                    else "container exited after default SIGTERM (143)"
+                )
+                log_event(
+                    root,
+                    f"Supervisor reported app state=error after acknowledged manual stop; Docker confirmed {detail} and no Frigate writer remains active.",
+                )
+            return info
+
+        if active:
+            raise LabFailure("a Frigate writer remained active after Supervisor's successful stop job")
+        time.sleep(5)
+
+    raise LabFailure(
+        f"app {slug} did not become quiescent after acknowledged stop; "
+        f"Supervisor state={last_state!r}, container state={last_container_state!r}"
+    )
 
 
 def cli_info(console: HAOSConsole, slug: str) -> dict[str, Any]:
@@ -735,7 +837,7 @@ def run_lab() -> None:
             raise LabFailure("synthetic rollback app was not started before handoff")
 
         console.json_command(f"ha apps stop {LOCAL_PREVIOUS_SLUG} --no-progress --raw-json", timeout=600)
-        wait_for_app(console, LOCAL_PREVIOUS_SLUG, "stopped", timeout=300)
+        wait_for_app_quiesced(console, LOCAL_PREVIOUS_SLUG, old_container[0], root, timeout=300)
         assert_single_writer(console, None)
         log_event(root, "Previous Frigate writer stopped before candidate start; zero overlapping Frigate containers.")
 
@@ -765,7 +867,13 @@ def run_lab() -> None:
         app_api_from_core(console, candidate_after_reboot_container[0], root)
 
         console.json_command(f"ha apps stop {LOCAL_CANDIDATE_SLUG} --no-progress --raw-json", timeout=600)
-        wait_for_app(console, LOCAL_CANDIDATE_SLUG, "stopped", timeout=300)
+        wait_for_app_quiesced(
+            console,
+            LOCAL_CANDIDATE_SLUG,
+            candidate_after_reboot_container[0],
+            root,
+            timeout=300,
+        )
         assert_single_writer(console, None)
         rollback_info = console.json_command(f"ha apps start {LOCAL_PREVIOUS_SLUG} --no-progress --raw-json", timeout=900)
         old_after_rollback = wait_for_app(console, LOCAL_PREVIOUS_SLUG, "started", timeout=900)
@@ -775,7 +883,7 @@ def run_lab() -> None:
         log_event(root, "Rollback to the previous official image succeeded with the synthetic media marker preserved and one writer active.")
 
         console.json_command(f"ha apps stop {LOCAL_PREVIOUS_SLUG} --no-progress --raw-json", timeout=600)
-        wait_for_app(console, LOCAL_PREVIOUS_SLUG, "stopped", timeout=300)
+        wait_for_app_quiesced(console, LOCAL_PREVIOUS_SLUG, old_after_rollback_container[0], root, timeout=300)
         assert_single_writer(console, None)
 
         summary = {
