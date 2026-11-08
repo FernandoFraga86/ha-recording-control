@@ -798,7 +798,7 @@ def app_api_from_core(console: HAOSConsole, container_id: str, root: Path) -> No
         raise LabFailure("Supervisor app container has no address on the isolated HA network")
     python = (
         "import urllib.request; "
-        f'print(urllib.request.urlopen("http://{address}:5000/version", timeout=10).read().decode().strip())'
+        f'print(urllib.request.urlopen("http://{address}:5000/api/version", timeout=10).read().decode().strip())'
     )
     output = docker_output(
         console,
@@ -807,7 +807,7 @@ def app_api_from_core(console: HAOSConsole, container_id: str, root: Path) -> No
     )
     version_lines = [line.strip() for line in output.splitlines() if re.match(r"^0\.18\.2(?:[-.]|$)", line.strip())]
     if not version_lines:
-        raise LabFailure("HA Core could not retrieve the synthetic Frigate /version response")
+        raise LabFailure("HA Core could not retrieve the synthetic Frigate /api/version response")
     log_event(root, "HA Core container reached the Supervisor-managed Frigate API over the app network.")
 
 

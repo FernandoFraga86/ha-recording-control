@@ -171,6 +171,12 @@ class SupervisorAppLabTests(unittest.TestCase):
         info["ingress_entry"] = "/"
         self.assertFalse(module.ingress_metadata_valid(info))
 
+    def test_core_to_app_probe_uses_pinned_frigate_api_version_path(self) -> None:
+        source = (ROOT / "tools" / "supervisor_app_lab.py").read_text(encoding="utf-8")
+        self.assertIn('"http://{address}:5000/api/version"', source)
+        self.assertIn("Frigate /api/version response", source)
+        self.assertNotIn('"http://{address}:5000/version"', source)
+
 
 if __name__ == "__main__":
     unittest.main()
