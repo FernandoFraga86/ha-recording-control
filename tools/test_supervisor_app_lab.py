@@ -167,7 +167,8 @@ class SupervisorAppLabTests(unittest.TestCase):
         compile(core_probe, "core-api-permission-probe", "exec")
         compile(ingress_probe, "ingress-permission-probe", "exec")
         self.assertLess(len("docker exec candidate python3 -c " + __import__("shlex").quote(core_probe)), 1024)
-        self.assertLess(len("docker exec homeassistant python3 -c " + __import__("shlex").quote(ingress_probe)), 1024)
+        self.assertIn("guest_write(console, guest_script, python)", inspect.getsource(module.ingress_to_app_api))
+        self.assertIn("docker cp", inspect.getsource(module.ingress_to_app_api))
 
     def test_bad_or_drifted_template_fails_closed(self) -> None:
         with self.assertRaises(module.LabFailure):

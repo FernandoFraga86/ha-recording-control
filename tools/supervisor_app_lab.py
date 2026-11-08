@@ -896,14 +896,26 @@ def app_core_api_denied(console: HAOSConsole, container_id: str, root: Path) -> 
 
 
 def ingress_probe_source(ingress_path: str) -> str:
-    return (
-        "import json,secrets,urllib.parse as p,urllib.request as u; "
-        'b="http://127.0.0.1:8123"; c="http://home-assistant.io"; '
-        'x={"name":"Lab","username":"l"+secrets.token_hex(4),"password":secrets.token_hex(16),"client_id":c,"language":"en"}; '
-        'a=json.loads(u.urlopen(u.Request(b+"/api/onboarding/users",data=json.dumps(x).encode(),headers={"Content-Type":"application/json"}),timeout=15).read())["auth_code"]; '
-        'f=p.urlencode({"grant_type":"authorization_code","code":a,"client_id":c}).encode(); '
-        't=json.loads(u.urlopen(u.Request(b+"/auth/token",data=f,headers={"Content-Type":"application/x-www-form-urlencoded"}),timeout=15).read())["access_token"]; '
-        f"print(u.urlopen(u.Request(b+{ingress_path!r},headers={{'Authorization':'Bearer '+t}}),timeout=20).read().decode().strip())"
+    return "\n".join(
+        (
+            "import json,secrets,urllib.parse,urllib.request,urllib.error",
+            'base="http://127.0.0.1:8123"; client="http://home-assistant.io"; stage="onboarding"',
+            "try:",
+            ' payload={"name":"Lab","username":"l"+secrets.token_hex(4),"password":secrets.token_hex(16),"client_id":client,"language":"en"}',
+            ' request=urllib.request.Request(base+"/api/onboarding/users",data=json.dumps(payload).encode(),headers={"Content-Type":"application/json"})',
+            ' auth_code=json.loads(urllib.request.urlopen(request,timeout=15).read())["auth_code"]',
+            ' stage="token"',
+            ' form=urllib.parse.urlencode({"grant_type":"authorization_code","code":auth_code,"client_id":client}).encode()',
+            ' request=urllib.request.Request(base+"/auth/token",data=form,headers={"Content-Type":"application/x-www-form-urlencoded"})',
+            ' access=json.loads(urllib.request.urlopen(request,timeout=15).read())["access_token"]',
+            ' stage="ingress"',
+            f' request=urllib.request.Request(base+{ingress_path!r},headers={{"Authorization":"Bearer "+access}})',
+            ' print(urllib.request.urlopen(request,timeout=20).read().decode().strip())',
+            'except urllib.error.HTTPError as error:',
+            ' print("LAB_ERROR stage="+stage+" status="+str(error.code))',
+            'except Exception as error:',
+            ' print("LAB_ERROR stage="+stage+" kind="+type(error).__name__)',
+        )
     )
 
 
@@ -914,9 +926,23 @@ def ingress_to_app_api(console: HAOSConsole, info: dict[str, Any], root: Path) -
         raise LabFailure("cannot test ingress because Supervisor did not provide a valid ingress entry")
     ingress_path = entry + "/api/version"
     python = ingress_probe_source(ingress_path)
-    output = docker_output(console, f"docker exec homeassistant python3 -c {shlex.quote(python)}", timeout=90)
-    if not any(re.match(r"^0\.18\.2(?:[-.]|$)", line.strip()) for line in output.splitlines()):
-        raise LabFailure("authenticated Home Assistant ingress did not return the pinned Frigate API version")
+    guest_script = f"{LOCAL_REPOSITORY_PATH}/recording_control/permission_ingress_probe.py"
+    core_script = "/tmp/permission_ingress_probe.py"
+    guest_write(console, guest_script, python)
+    try:
+        output = docker_output(
+            console,
+            f"docker cp {guest_script} homeassistant:{core_script} && docker exec homeassistant python3 {core_script}",
+            timeout=90,
+        )
+        diagnostic = re.search(r"LAB_ERROR stage=([a-z]+) (?:status=(\d+)|kind=([A-Za-z]+))", output)
+        if diagnostic:
+            detail = f"HTTP {diagnostic.group(2)}" if diagnostic.group(2) else diagnostic.group(3)
+            raise LabFailure(f"authenticated ingress probe failed at {diagnostic.group(1)} ({detail})")
+        if not any(re.match(r"^0\.18\.2(?:[-.]|$)", line.strip()) for line in output.splitlines()):
+            raise LabFailure("authenticated Home Assistant ingress did not return the pinned Frigate API version")
+    finally:
+        console.run(f"rm -f {guest_script}; docker exec homeassistant rm -f {core_script}", timeout=30, allow_failure=True)
     log_event(root, "Authenticated Home Assistant ingress reached the pinned app API; temporary lab account/token were not recorded.")
 
 
