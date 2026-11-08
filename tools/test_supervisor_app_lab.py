@@ -159,6 +159,18 @@ class SupervisorAppLabTests(unittest.TestCase):
         self.assertIn('info.get("version_latest") != version', source)
         self.assertNotIn('console.json_command("ha store reload --no-progress --raw-json"', source)
 
+    def test_supervisor_ingress_metadata_uses_effective_token_route_without_logging_token(self) -> None:
+        info = {
+            "webui": "http://[HOST]:5000/",
+            "ingress_entry": "/api/hassio_ingress/lab-token-placeholder",
+            "ingress_url": "/api/hassio_ingress/lab-token-placeholder//",
+        }
+        self.assertTrue(module.ingress_metadata_valid(info))
+        info["ingress_url"] = "/api/hassio_ingress/different-token/"
+        self.assertFalse(module.ingress_metadata_valid(info))
+        info["ingress_entry"] = "/"
+        self.assertFalse(module.ingress_metadata_valid(info))
+
 
 if __name__ == "__main__":
     unittest.main()

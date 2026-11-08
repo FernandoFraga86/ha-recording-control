@@ -728,7 +728,7 @@ def verify_candidate_metadata(console: HAOSConsole, info: dict[str, Any], contai
             raise LabFailure(f"Supervisor app-info field {key} did not match the isolated lab contract")
     if not isinstance(info.get("ingress_url"), str) or not info["ingress_url"]:
         raise LabFailure("Supervisor did not create an ingress route for the running app")
-    if not info.get("webui") or info.get("ingress_entry") != "/":
+    if not ingress_metadata_valid(info):
         raise LabFailure("Supervisor app UI/ingress metadata is incomplete")
     panel = info.get("ingress_panel")
     if isinstance(panel, dict) and panel.get("admin") is not False:
@@ -758,6 +758,17 @@ def verify_candidate_metadata(console: HAOSConsole, info: dict[str, Any], contai
         root,
         "Supervisor effective metadata verified: ingress, API grants, explicit port bindings, writable media/config/homeassistant mounts, no host network/full access, and PERFMON.",
     )
+
+
+def ingress_metadata_valid(info: dict[str, Any]) -> bool:
+    """Validate Supervisor's effective ingress URLs without exposing their token."""
+    entry = info.get("ingress_entry")
+    url = info.get("ingress_url")
+    if not isinstance(entry, str) or not re.fullmatch(r"/api/hassio_ingress/[^/]+", entry):
+        return False
+    if not isinstance(url, str) or not url.startswith(entry + "/"):
+        return False
+    return info.get("webui") == "http://[HOST]:5000/"
 
 
 def app_api_from_core(console: HAOSConsole, container_id: str, root: Path) -> None:
