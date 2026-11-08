@@ -39,6 +39,7 @@ LOCAL_REPOSITORY_PATH = "/mnt/data/supervisor/apps/local"
 LOCAL_CANDIDATE_SLUG = "local_recording_control"
 LOCAL_PREVIOUS_SLUG = "local_recording_control_previous"
 PROMPT = "__HA_RECORDING_CONTROL_LAB_PROMPT__"
+MAX_GUEST_COMMAND_CHARS = 1024
 LOGIN_PROMPT = "homeassistant login: "
 
 
@@ -510,10 +511,24 @@ def guest_write(console: HAOSConsole, path: str, content: str) -> None:
     if not re.fullmatch(r"/mnt/data/supervisor/(?:apps/local|app_configs)/[A-Za-z0-9_./-]+", path):
         raise LabFailure("refusing to write a lab manifest outside the disposable Supervisor data tree")
     parent = path.rsplit("/", 1)[0]
-    console.run(
-        f"mkdir -p {parent} && test ! -e {path} && printf '%s' '{encoded}' | base64 -d > {path} && chmod 0644 {path}",
-        timeout=30,
+    # A full manifest command left the HAOS serial shell at its continuation
+    # prompt during the first native run. Keep each command short; 512 encoded
+    # characters is divisible by four, so each chunk remains independently
+    # decodable and is acknowledged before the next chunk is sent.
+    chunks = [encoded[index:index + 512] for index in range(0, len(encoded), 512)]
+    if not chunks:
+        chunks = [""]
+    first = (
+        f"mkdir -p {parent} && test ! -e {path} && printf '%s' '{chunks[0]}' "
+        f"| base64 -d > {path} && chmod 0644 {path}"
     )
+    commands = [first]
+    for chunk in chunks[1:]:
+        commands.append(f"printf '%s' '{chunk}' | base64 -d >> {path}")
+    if any(len(command) >= MAX_GUEST_COMMAND_CHARS for command in commands):
+        raise LabFailure("refusing to send an oversized command to the HAOS serial shell")
+    for command in commands:
+        console.run(command, timeout=30)
 
 
 def store_local_manifests(console: HAOSConsole, root: Path) -> None:

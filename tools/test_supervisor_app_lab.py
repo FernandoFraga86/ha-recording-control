@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import base64
 from pathlib import Path
+import re
 import unittest
 
 
@@ -15,6 +17,39 @@ SPEC.loader.exec_module(module)
 
 
 class SupervisorAppLabTests(unittest.TestCase):
+    def test_guest_write_splits_base64_into_short_independently_decodable_commands(self) -> None:
+        class RecordingConsole:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+
+            def run(self, command: str, timeout: int = 180) -> str:
+                self.commands.append(command)
+                return ""
+
+        console = RecordingConsole()
+        payload = "manifest: " + "x" * 4200 + "\n"
+        module.guest_write(console, "/mnt/data/supervisor/apps/local/lab/config.yaml", payload)
+
+        self.assertGreater(len(console.commands), 1)
+        self.assertTrue(all(len(command) < 1024 for command in console.commands))
+        self.assertIn(" > /mnt/data/supervisor/apps/local/lab/config.yaml", console.commands[0])
+        self.assertTrue(all(" >> /mnt/data/supervisor/apps/local/lab/config.yaml" in command for command in console.commands[1:]))
+
+        encoded_chunks = []
+        for command in console.commands:
+            match = re.search(r"printf '%s' '([A-Za-z0-9+/=]*)'", command)
+            self.assertIsNotNone(match)
+            encoded_chunks.append(match.group(1))
+        self.assertEqual(base64.b64decode("".join(encoded_chunks)).decode("utf-8"), payload)
+
+    def test_guest_write_refuses_paths_outside_disposable_supervisor_data(self) -> None:
+        class RecordingConsole:
+            def run(self, command: str, timeout: int = 180) -> str:
+                raise AssertionError("must validate path before sending guest commands")
+
+        with self.assertRaises(module.LabFailure):
+            module.guest_write(RecordingConsole(), "/config/configuration.yaml", "not allowed")
+
     def test_candidate_manifest_comes_from_template_and_only_overrides_lab_hardware_and_boot(self) -> None:
         original = module.TEMPLATE_PATH.read_text(encoding="utf-8")
         candidate = module.candidate_lab_manifest(original)
