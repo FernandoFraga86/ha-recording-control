@@ -930,11 +930,9 @@ def ingress_to_app_api(console: HAOSConsole, info: dict[str, Any], root: Path) -
     core_script = "/tmp/permission_ingress_probe.py"
     guest_write(console, guest_script, python)
     try:
-        output = docker_output(
-            console,
-            f"docker cp {guest_script} homeassistant:{core_script} && docker exec homeassistant python3 {core_script}",
-            timeout=90,
-        )
+        console.run(f"test -s {guest_script}", timeout=30)
+        console.run(f"docker cp {guest_script} homeassistant:{core_script}", timeout=45)
+        output = docker_output(console, f"docker exec homeassistant python3 {core_script}", timeout=90)
         diagnostic = re.search(r"LAB_ERROR stage=([a-z]+) (?:status=(\d+)|kind=([A-Za-z]+))", output)
         if diagnostic:
             detail = f"HTTP {diagnostic.group(2)}" if diagnostic.group(2) else diagnostic.group(3)
