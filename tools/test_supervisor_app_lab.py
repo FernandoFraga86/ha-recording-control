@@ -132,6 +132,13 @@ class SupervisorAppLabTests(unittest.TestCase):
         self.assertIn(f'image: "{module.GHCR_IMAGE}"', reduced)
         self.assertIn(f'version: "{module.GHCR_TAG}"', reduced)
 
+    def test_permission_manifest_reload_uses_effective_store_readback(self) -> None:
+        source = inspect.getsource(module.store_permission_lab_manifest)
+        self.assertIn('console.run("ha store reload --no-progress"', source)
+        self.assertIn('info.get("available") is not True', source)
+        self.assertIn('info.get("homeassistant_api") is not False', source)
+        self.assertNotIn('"Command completed successfully."', source)
+
     def test_permission_lab_has_positive_core_and_ingress_probes_and_no_reboot(self) -> None:
         source = inspect.getsource(module.run_permission_lab)
         self.assertIn("homeassistant_api=False", source)

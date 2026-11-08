@@ -673,9 +673,9 @@ def store_permission_lab_manifest(console: HAOSConsole, root: Path) -> None:
     candidate = candidate_lab_manifest(template, homeassistant_api=False)
     guest_write(console, f"{LOCAL_REPOSITORY_PATH}/recording_control/config.yaml", candidate)
     guest_write(console, "/mnt/data/supervisor/app_configs/local_recording_control/config.yml", synthetic_frigate_config())
-    reload_output = console.run("ha store reload --no-progress", timeout=180)
-    if "Command completed successfully." not in reload_output:
-        raise LabFailure("Supervisor CLI did not positively report local permission-lab store reload success")
+    # `run()` already fails on a non-zero command status. Verify the resulting
+    # Supervisor store entry below instead of depending on presentation text.
+    console.run("ha store reload --no-progress", timeout=180)
     info = cli_info(console, LOCAL_CANDIDATE_SLUG)
     if info.get("slug") != LOCAL_CANDIDATE_SLUG or info.get("available") is not True:
         raise LabFailure("Supervisor permission-lab entry is not available after store reload")
