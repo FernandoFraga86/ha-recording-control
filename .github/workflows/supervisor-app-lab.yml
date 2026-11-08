@@ -1,0 +1,87 @@
+name: Supervisor app validation lab
+
+on:
+  push:
+    branches:
+      - codex/supervisor-app-lab-2026-10-5
+
+permissions: {}
+
+concurrency:
+  group: ha-recording-control-supervisor-app-lab
+  cancel-in-progress: false
+
+jobs:
+  haos-supervisor:
+    if: >-
+      github.repository == 'FernandoFraga86/ha-recording-control' &&
+      github.ref == 'refs/heads/codex/supervisor-app-lab-2026-10-5'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the isolated lab harness
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # pinned checkout revision already used by this repository
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Preflight remote runner before package install or image download
+        shell: bash
+        run: |
+          set -euo pipefail
+          disk_available="$(df --output=avail -B1 / | tail -n 1 | tr -d ' ')"
+          memory_available_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+          cpu_count="$(nproc)"
+          required_disk_bytes="$((40 * 1024 * 1024 * 1024))"
+          required_memory_kib="$((10 * 1024 * 1024))"
+          printf 'Remote HAOS lab preflight: disk=%s bytes, MemAvailable=%s KiB, CPUs=%s, kvm=%s\n' \
+            "$disk_available" "$memory_available_kib" "$cpu_count" "$(test -e /dev/kvm && echo present || echo absent)"
+          {
+            echo '### HAOS/Supervisor remote lab preflight'
+            echo
+            echo "- Free runner disk: $disk_available bytes (minimum $required_disk_bytes)."
+            echo "- Available RAM: $memory_available_kib KiB (minimum $required_memory_kib KiB)."
+            echo "- CPUs: $cpu_count (minimum 4)."
+            echo "- KVM device: $(test -e /dev/kvm && echo present || echo absent); checked before package/image downloads."
+            echo '- This is a disposable GitHub-hosted QEMU guest; the local VMware VM, household HA, broker, and cameras are not contacted.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if (( disk_available < required_disk_bytes || memory_available_kib < required_memory_kib || cpu_count < 4 )) || [[ ! -e /dev/kvm ]]; then
+            echo 'Remote runner does not meet the HAOS lab capacity/KVM gate; stopping before apt or image downloads.' >&2
+            exit 1
+          fi
+
+      - name: Install QEMU tools only on the disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils ovmf xz-utils python3-pexpect
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 0666 /dev/kvm
+          qemu-system-x86_64 -machine none,accel=kvm -S -display none -nodefaults -monitor none -serial none -daemonize -pidfile "$RUNNER_TEMP/kvm-probe.pid"
+          kill "$(cat "$RUNNER_TEMP/kvm-probe.pid")"
+          rm -f "$RUNNER_TEMP/kvm-probe.pid"
+          df -h /
+
+      - name: Run real HAOS 18.4 with Supervisor 2026.10.5 and the local experimental app package
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: python3 tools/supervisor_app_lab.py run
+
+      - name: Preserve sanitized lab evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: supervisor-app-lab-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/ha-recording-control-supervisor-lab/lab-summary.json
+            ${{ runner.temp }}/ha-recording-control-supervisor-lab/lab-events.txt
+          if-no-files-found: ignore
+          retention-days: 7
