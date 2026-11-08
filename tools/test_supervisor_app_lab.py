@@ -161,6 +161,40 @@ class SupervisorAppLabTests(unittest.TestCase):
         with self.assertRaises(module.LabFailure):
             module.parse_permission_lab_app_info("Supervisor returned no structured app info")
 
+    def test_permission_lab_cli_diagnostic_records_shape_not_response_values(self) -> None:
+        output = (
+            '{"result":"ok","data":{"slug":"local_recording_control",'
+            '"options":{"password":"never-log-this"}}}\n__HA_RC_COMMAND_RC__0\n'
+        )
+        diagnostic = module.permission_lab_cli_shape(output)
+        self.assertIn("exit_code=0", diagnostic)
+        self.assertIn("root_keys=['data', 'result']", diagnostic)
+        self.assertIn("data_keys=['options', 'slug']", diagnostic)
+        self.assertNotIn("never-log-this", diagnostic)
+
+    def test_official_supervisor_api_probe_is_read_only_and_returns_allowlisted_fields(self) -> None:
+        source = module.supervisor_app_info_probe_source("local_recording_control")
+        compile(source, "supervisor-app-info-probe", "exec")
+        self.assertIn("http://supervisor/addons/", source)
+        self.assertIn('os.environ.get("SUPERVISOR_TOKEN")', source)
+        self.assertIn('"ingress_entry"', source)
+        self.assertNotIn('print(token)', source)
+        self.assertNotIn("options", source)
+        self.assertEqual(
+            module.parse_supervisor_app_info_probe(
+                'root@haos: docker exec ... "print(\\"LAB_SUPERVISOR_APP_INFO=\\")"\n'
+                'LAB_SUPERVISOR_APP_INFO={"slug":"local_recording_control",'
+                '"available":true,"homeassistant_api":false}\n'
+            ),
+            {
+                "slug": "local_recording_control",
+                "available": True,
+                "homeassistant_api": False,
+            },
+        )
+        with self.assertRaises(module.LabFailure):
+            module.parse_supervisor_app_info_probe("LAB_SUPERVISOR_APP_INFO_ERROR status=404")
+
     def test_permission_lab_has_positive_core_and_ingress_probes_and_no_reboot(self) -> None:
         source = inspect.getsource(module.run_permission_lab)
         self.assertIn("homeassistant_api=False", source)

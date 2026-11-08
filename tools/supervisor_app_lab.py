@@ -612,6 +612,103 @@ def permission_lab_cli_info(console: HAOSConsole, slug: str) -> dict[str, Any]:
     return parse_permission_lab_app_info(output)
 
 
+def permission_lab_cli_shape(output: str) -> str:
+    """Describe CLI response shape without logging any response values."""
+    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output).replace("\r", "")
+    marker = "__HA_RC_COMMAND_RC__"
+    matches = re.findall(re.escape(marker) + r"(\d+)", cleaned)
+    code = matches[-1] if matches else "missing"
+    decoder = json.JSONDecoder()
+    shapes: list[str] = []
+    for index, char in enumerate(cleaned):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(cleaned[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            keys = sorted(str(key) for key in value.keys())
+            data = value.get("data")
+            data_keys = sorted(str(key) for key in data.keys()) if isinstance(data, dict) else []
+            shapes.append(f"root_keys={keys[:12]},data_keys={data_keys[:20]}")
+            break
+    shape = shapes[0] if shapes else f"json_object_count=0,opening_braces={cleaned.count('{')}"
+    controls = sum(ord(char) < 32 and char not in "\n\t" for char in output)
+    return f"exit_code={code},{shape},output_chars={len(output)},control_chars={controls}"
+
+
+def supervisor_app_info_probe_source(slug: str) -> str:
+    """Query only allowlisted Supervisor app fields from trusted HA Core; never print its token."""
+    safe_slug = repr(slug)
+    return "\n".join(
+        (
+            "import json,os,urllib.error,urllib.request",
+            f"slug={safe_slug}",
+            'token=os.environ.get("SUPERVISOR_TOKEN")',
+            'if not token: print("LAB_SUPERVISOR_APP_INFO_ERROR kind=token_missing")',
+            "else:",
+            ' request=urllib.request.Request("http://supervisor/addons/"+slug+"/info",headers={"Authorization":"Bearer "+token})',
+            " try:",
+            '  response=urllib.request.urlopen(request,timeout=15); payload=json.load(response); data=payload.get("data",payload) if isinstance(payload,dict) else None',
+            '  if not isinstance(data,dict) or payload.get("result","ok")!="ok": print("LAB_SUPERVISOR_APP_INFO_ERROR kind=unexpected_shape")',
+            "  else:",
+            '   fields=("slug","available","version_latest","version","state","boot","startup","ingress","ingress_port","ingress_entry","ingress_url","ingress_panel","homeassistant_api","hassio_api","hassio_role","full_access","usb","video","privileged","devices","ports","arch","build")',
+            '   safe={key:data[key] for key in fields if key in data}',
+            '   print("LAB_SUPERVISOR_APP_INFO="+json.dumps(safe,separators=(",",":"),sort_keys=True))',
+            " except urllib.error.HTTPError as error:",
+            '  print("LAB_SUPERVISOR_APP_INFO_ERROR status="+str(error.code))',
+            " except Exception as error:",
+            '  print("LAB_SUPERVISOR_APP_INFO_ERROR kind="+type(error).__name__)',
+        )
+    )
+
+
+def parse_supervisor_app_info_probe(output: str) -> dict[str, Any]:
+    marker = "LAB_SUPERVISOR_APP_INFO="
+    for line in output.splitlines():
+        line = line.strip()
+        error = re.fullmatch(r"LAB_SUPERVISOR_APP_INFO_ERROR (?:status=(\d+)|kind=([A-Za-z]+))", line)
+        if error:
+            detail = f"HTTP {error.group(1)}" if error.group(1) else error.group(2)
+            raise LabFailure(f"official Supervisor app-info API lookup failed ({detail})")
+        if not line.startswith(marker):
+            continue
+        candidate = line[len(marker):].strip()
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError as err:
+            raise LabFailure("official Supervisor app-info API returned malformed allowlisted data") from err
+        if isinstance(value, dict):
+            return value
+    raise LabFailure("official Supervisor app-info API returned no allowlisted app record")
+
+
+def supervisor_app_info_from_core(console: HAOSConsole, slug: str) -> dict[str, Any]:
+    source = supervisor_app_info_probe_source(slug)
+    output = docker_output(
+        console,
+        f"docker exec homeassistant python3 -c {shlex.quote(source)}",
+        timeout=60,
+    )
+    return parse_supervisor_app_info_probe(output)
+
+
+def permission_lab_wait_for_app(console: HAOSConsole, slug: str, state: str, timeout: int = 900) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    last_state = "unavailable"
+    while time.monotonic() < deadline:
+        try:
+            info = supervisor_app_info_from_core(console, slug)
+            last_state = str(info.get("state", "missing"))
+            if info.get("slug") == slug and last_state == state:
+                return info
+        except LabFailure:
+            last_state = "api-read-failed"
+        time.sleep(5)
+    raise LabFailure(f"Supervisor API did not report {slug} state {state}; last state={last_state}")
+
+
 def wait_for_app(console: HAOSConsole, slug: str, state: str, timeout: int = 600) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     last_state = None
@@ -701,7 +798,18 @@ def store_permission_lab_manifest(console: HAOSConsole, root: Path) -> None:
     # `run()` already fails on a non-zero command status. Verify the resulting
     # Supervisor store entry below instead of depending on presentation text.
     console.run("ha store reload --no-progress", timeout=180)
-    info = permission_lab_cli_info(console, LOCAL_CANDIDATE_SLUG)
+    cli_output = console.run(
+        f"ha apps info {LOCAL_CANDIDATE_SLUG} --no-progress --raw-json",
+        timeout=60,
+        allow_failure=True,
+    )
+    cli_shape = permission_lab_cli_shape(cli_output)
+    try:
+        info = parse_permission_lab_app_info(cli_output)
+        log_event(root, f"Supervisor CLI app discovery response shape: {cli_shape}.")
+    except LabFailure:
+        log_event(root, f"Supervisor CLI app discovery was not parseable; sanitized response shape: {cli_shape}; using the official read-only app-info API.")
+        info = supervisor_app_info_from_core(console, LOCAL_CANDIDATE_SLUG)
     if info.get("slug") != LOCAL_CANDIDATE_SLUG or info.get("available") is not True:
         raise LabFailure("Supervisor permission-lab entry is not available after store reload")
     if info.get("version_latest") != GHCR_TAG:
@@ -1030,10 +1138,19 @@ def run_permission_lab() -> None:
         wait_for_supervisor(console, root)
 
         store_permission_lab_manifest(console, root)
-        app_info = install_start(console, LOCAL_CANDIDATE_SLUG, root)
+        console.json_command(
+            f"ha apps install {LOCAL_CANDIDATE_SLUG} --no-progress --raw-json",
+            timeout=1800,
+        )
+        console.json_command(
+            f"ha apps start {LOCAL_CANDIDATE_SLUG} --no-progress --raw-json",
+            timeout=900,
+        )
+        app_info = permission_lab_wait_for_app(console, LOCAL_CANDIDATE_SLUG, "started")
+        log_event(root, "Supervisor API confirmed the reduced-permission candidate is installed and started.")
         candidate_container = container_for_image(console, GHCR_IMAGE + ":")
         verify_pulled_image_digest(console, GHCR_IMAGE + ":" + GHCR_TAG, {GHCR_DIGEST})
-        app_info = permission_lab_cli_info(console, LOCAL_CANDIDATE_SLUG)
+        app_info = supervisor_app_info_from_core(console, LOCAL_CANDIDATE_SLUG)
         candidate_container_data = inspect_container(console, candidate_container[0])
         verify_candidate_metadata(
             console,
