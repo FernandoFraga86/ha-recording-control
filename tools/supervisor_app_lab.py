@@ -641,11 +641,32 @@ def store_local_manifests(console: HAOSConsole, root: Path) -> None:
     guest_write(console, f"{LOCAL_REPOSITORY_PATH}/recording_control_previous/config.yaml", previous)
     guest_write(console, "/mnt/data/supervisor/app_configs/local_recording_control/config.yml", synthetic_frigate_config())
     guest_write(console, "/mnt/data/supervisor/app_configs/local_recording_control_previous/config.yml", synthetic_frigate_config())
-    console.json_command("ha store reload --no-progress --raw-json", timeout=180)
+    # The store-reload API may return an empty response body. In --raw-json
+    # mode the CLI prints that body verbatim, so json_command() cannot parse it.
+    # Use the CLI's success response, then independently inspect both store
+    # entries before any app installation is attempted.
+    reload_output = console.run("ha store reload --no-progress", timeout=180)
+    if "Command completed successfully." not in reload_output:
+        raise LabFailure("Supervisor CLI did not positively report local store reload success")
+    verify_local_store_entries(console, root)
     log_event(
         root,
         "Supervisor local app manifests loaded; lab-only differences are boot:auto and omission of unavailable camera/GPU/USB devices.",
     )
+
+
+def verify_local_store_entries(console: HAOSConsole, root: Path) -> None:
+    expected = (
+        (LOCAL_PREVIOUS_SLUG, OFFICIAL_TAG),
+        (LOCAL_CANDIDATE_SLUG, GHCR_TAG),
+    )
+    for slug, version in expected:
+        info = cli_info(console, slug)
+        if info.get("slug") != slug or info.get("available") is not True:
+            raise LabFailure(f"Supervisor local store did not expose an available entry for {slug}")
+        if info.get("version_latest") != version:
+            raise LabFailure(f"Supervisor local store entry {slug} resolved an unexpected version")
+    log_event(root, "Supervisor confirmed both local app entries are available at their pinned versions.")
 
 
 def install_start(console: HAOSConsole, slug: str, root: Path) -> dict[str, Any]:

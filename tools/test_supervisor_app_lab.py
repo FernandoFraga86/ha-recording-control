@@ -151,6 +151,14 @@ class SupervisorAppLabTests(unittest.TestCase):
         self.assertIs(lock["installable"], False)
         self.assertIs(lock["native_recovery_enabled"], False)
 
+    def test_store_reload_uses_success_text_then_verifies_store_entries(self) -> None:
+        source = (ROOT / "tools" / "supervisor_app_lab.py").read_text(encoding="utf-8")
+        self.assertIn('console.run("ha store reload --no-progress", timeout=180)', source)
+        self.assertIn('"Command completed successfully."', source)
+        self.assertIn('info.get("available") is not True', source)
+        self.assertIn('info.get("version_latest") != version', source)
+        self.assertNotIn('console.json_command("ha store reload --no-progress --raw-json"', source)
+
 
 if __name__ == "__main__":
     unittest.main()
