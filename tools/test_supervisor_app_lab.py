@@ -139,6 +139,28 @@ class SupervisorAppLabTests(unittest.TestCase):
         self.assertIn('info.get("homeassistant_api") is not False', source)
         self.assertNotIn('"Command completed successfully."', source)
 
+    def test_permission_lab_app_info_parser_handles_terminal_noise_and_ansi(self) -> None:
+        output = (
+            "ha > \x1b[32m{\"result\":\"ok\",\"data\":"
+            "{\"slug\":\"local_recording_control\",\"available\":true,"
+            "\"homeassistant_api\":false}}\x1b[0m\r\n"
+            "prompt> "
+        )
+        self.assertEqual(
+            module.parse_permission_lab_app_info(output),
+            {
+                "slug": "local_recording_control",
+                "available": True,
+                "homeassistant_api": False,
+            },
+        )
+
+    def test_permission_lab_app_info_parser_fails_closed_on_non_ok_or_missing_json(self) -> None:
+        with self.assertRaises(module.LabFailure):
+            module.parse_permission_lab_app_info('{"result":"error","data":{}}')
+        with self.assertRaises(module.LabFailure):
+            module.parse_permission_lab_app_info("Supervisor returned no structured app info")
+
     def test_permission_lab_has_positive_core_and_ingress_probes_and_no_reboot(self) -> None:
         source = inspect.getsource(module.run_permission_lab)
         self.assertIn("homeassistant_api=False", source)
@@ -260,4 +282,3 @@ class SupervisorAppLabTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

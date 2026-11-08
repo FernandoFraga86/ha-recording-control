@@ -587,6 +587,31 @@ def cli_info(console: HAOSConsole, slug: str) -> dict[str, Any]:
     return data
 
 
+def parse_permission_lab_app_info(output: str) -> dict[str, Any]:
+    """Parse the lab app-info JSON after stripping serial-terminal control sequences."""
+    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output).replace("\r", "")
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(cleaned):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(cleaned[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and "result" in value:
+            if value.get("result") != "ok":
+                raise LabFailure("Supervisor returned a non-ok app-info result in the permission lab")
+            data = value.get("data")
+            if isinstance(data, dict):
+                return data
+    raise LabFailure("Supervisor app-info output had no parseable result object in the permission lab")
+
+
+def permission_lab_cli_info(console: HAOSConsole, slug: str) -> dict[str, Any]:
+    output = console.run(f"ha apps info {slug} --no-progress --raw-json", timeout=60, allow_failure=True)
+    return parse_permission_lab_app_info(output)
+
+
 def wait_for_app(console: HAOSConsole, slug: str, state: str, timeout: int = 600) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     last_state = None
@@ -676,20 +701,7 @@ def store_permission_lab_manifest(console: HAOSConsole, root: Path) -> None:
     # `run()` already fails on a non-zero command status. Verify the resulting
     # Supervisor store entry below instead of depending on presentation text.
     console.run("ha store reload --no-progress", timeout=180)
-    try:
-        info = cli_info(console, LOCAL_CANDIDATE_SLUG)
-    except LabFailure as err:
-        raw = console.run(
-            f"ha apps info {LOCAL_CANDIDATE_SLUG} --no-progress --raw-json",
-            timeout=60,
-            allow_failure=True,
-        )
-        lines = [line.strip() for line in raw.splitlines() if line.strip() and "__HA_RC_COMMAND_RC__" not in line]
-        diagnostic = lines[-1] if lines else "empty response"
-        diagnostic = re.sub(r"/api/hassio_ingress/[^\s/'\"]+", "/api/hassio_ingress/[redacted]", diagnostic)
-        diagnostic = re.sub(r"(?i)(token|password|secret)(\s*[:=]\s*)\S+", r"\1\2[redacted]", diagnostic)
-        diagnostic = re.sub(r"\s+", " ", diagnostic)[:200]
-        raise LabFailure(f"Supervisor store entry did not resolve after reload; {err}; CLI={diagnostic}") from err
+    info = permission_lab_cli_info(console, LOCAL_CANDIDATE_SLUG)
     if info.get("slug") != LOCAL_CANDIDATE_SLUG or info.get("available") is not True:
         raise LabFailure("Supervisor permission-lab entry is not available after store reload")
     if info.get("version_latest") != GHCR_TAG:
@@ -1021,7 +1033,7 @@ def run_permission_lab() -> None:
         app_info = install_start(console, LOCAL_CANDIDATE_SLUG, root)
         candidate_container = container_for_image(console, GHCR_IMAGE + ":")
         verify_pulled_image_digest(console, GHCR_IMAGE + ":" + GHCR_TAG, {GHCR_DIGEST})
-        app_info = cli_info(console, LOCAL_CANDIDATE_SLUG)
+        app_info = permission_lab_cli_info(console, LOCAL_CANDIDATE_SLUG)
         candidate_container_data = inspect_container(console, candidate_container[0])
         verify_candidate_metadata(
             console,
@@ -1224,4 +1236,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
