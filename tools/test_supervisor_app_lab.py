@@ -135,6 +135,24 @@ class SupervisorAppLabTests(unittest.TestCase):
         self.assertTrue(module.GHCR_DIGEST.startswith("sha256:e024fe700120021c"))
         self.assertEqual(module.SUPERVISOR_VERSION, "2026.10.5")
 
+    def test_recorded_supervisor_lab_pass_keeps_production_gates_closed(self) -> None:
+        lock = module.load_lock()
+        lab = lock["supervisor_lab"]
+        self.assertEqual(lab["status"], "passed_disposable_haos_lab_only")
+        self.assertEqual(lab["workflow_run_id"], "42435376634")
+        self.assertEqual(lab["workflow_commit"], "05caf1ea52f95af17ee604c672ad85323a9b8c4d")
+        self.assertEqual(lab["candidate_digest"], module.GHCR_DIGEST)
+        self.assertTrue(lab["artifact_sha256"].startswith("sha256:"))
+        self.assertTrue(lab["synthetic_marker_survived_reboot_and_rollback"])
+        self.assertTrue(lab["single_writer_handoff_verified"])
+        self.assertIs(lab["production_ready"], False)
+        self.assertIs(lab["installable"], False)
+        self.assertIs(lab["native_recovery_enabled"], False)
+        self.assertIs(lock["production_ready"], False)
+        self.assertIs(lock["installable"], False)
+        self.assertIs(lock["native_recovery_enabled"], False)
+        self.assertNotIn("target Supervisor load/install validation pending", lock["blocking_gates"])
+
     def test_workflow_is_branch_scoped_and_has_capacity_gate_before_apt(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "supervisor-app-lab.yml").read_text(encoding="utf-8")
         self.assertIn("codex/supervisor-app-lab-2026-10-5", workflow)

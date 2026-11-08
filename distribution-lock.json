@@ -76,11 +76,36 @@
     },
     "workflow_run_id": "42427714912"
   },
+  "supervisor_lab": {
+    "status": "passed_disposable_haos_lab_only",
+    "workflow_run_id": "42435376634",
+    "workflow_commit": "05caf1ea52f95af17ee604c672ad85323a9b8c4d",
+    "artifact_id": "13598929572",
+    "artifact_sha256": "sha256:6544f2c8976f5135ff7ff8dfc3af3d632a8a35f938575f8b44f886ef570f05d0",
+    "haos_release": "18.4",
+    "supervisor_version": "2026.10.5",
+    "core_version": "2026.10.5",
+    "candidate_image": "ghcr.io/fernandofraga86/ha-recording-control:0.18.2-recording-control-1ca90f8-rebrand1-rootfs1",
+    "candidate_digest": "sha256:e024fe700120021c710c08bd28d7e65e5f24442755a0381c028bdf3596ebf7c4",
+    "rollback_image": "ghcr.io/blakeblackshear/frigate:0.18.2",
+    "rollback_index_digest": "sha256:fd60f99ffd4eb6c42360ed4e14953e270586f239309ab3983e55b2e97ffac09a",
+    "candidate_boot": "auto (temporary lab-only manifest; production template remains manual)",
+    "synthetic_marker_survived_reboot_and_rollback": true,
+    "single_writer_handoff_verified": true,
+    "production_ready": false,
+    "installable": false,
+    "native_recovery_enabled": false,
+    "limitations": [
+      "Disposable HAOS guest only; no household endpoints, cameras, feeds, GPU, USB devices, or real recordings.",
+      "Supervisor reports error after acknowledged manual stop; the harness separately verified container removal and zero active Frigate writers, not graceful app shutdown.",
+      "No household backup restore, camera privacy, physical-device behavior, or production recovery was tested."
+    ]
+  },
   "installable": false,
   "blocking_gates": [
-    "Supervisor and production validation pending; synthetic Core/Mosquitto/Frigate service test passed in run 42427714912",
-    "target Supervisor load/install validation pending",
-    "startup recovery and privacy acceptance validation pending",
-    "independent backup restore and executable production rollback validation pending"
+    "Household installation and production validation remain pending; disposable Supervisor lab passed in run 42435376634",
+    "Household-specific configuration, camera privacy, permissions, hardware, and physical-device behavior remain unvalidated",
+    "Independent household backup restore and executable production rollback validation remain pending",
+    "Production readiness and deployment authorization remain false"
   ]
 }
