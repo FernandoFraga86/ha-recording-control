@@ -676,7 +676,20 @@ def store_permission_lab_manifest(console: HAOSConsole, root: Path) -> None:
     # `run()` already fails on a non-zero command status. Verify the resulting
     # Supervisor store entry below instead of depending on presentation text.
     console.run("ha store reload --no-progress", timeout=180)
-    info = cli_info(console, LOCAL_CANDIDATE_SLUG)
+    try:
+        info = cli_info(console, LOCAL_CANDIDATE_SLUG)
+    except LabFailure as err:
+        raw = console.run(
+            f"ha apps info {LOCAL_CANDIDATE_SLUG} --no-progress --raw-json",
+            timeout=60,
+            allow_failure=True,
+        )
+        lines = [line.strip() for line in raw.splitlines() if line.strip() and "__HA_RC_COMMAND_RC__" not in line]
+        diagnostic = lines[-1] if lines else "empty response"
+        diagnostic = re.sub(r"/api/hassio_ingress/[^\s/'\"]+", "/api/hassio_ingress/[redacted]", diagnostic)
+        diagnostic = re.sub(r"(?i)(token|password|secret)(\s*[:=]\s*)\S+", r"\1\2[redacted]", diagnostic)
+        diagnostic = re.sub(r"\s+", " ", diagnostic)[:200]
+        raise LabFailure(f"Supervisor store entry did not resolve after reload; {err}; CLI={diagnostic}") from err
     if info.get("slug") != LOCAL_CANDIDATE_SLUG or info.get("available") is not True:
         raise LabFailure("Supervisor permission-lab entry is not available after store reload")
     if info.get("version_latest") != GHCR_TAG:
