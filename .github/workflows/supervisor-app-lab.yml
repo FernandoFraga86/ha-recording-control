@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - codex/supervisor-app-lab-2026-10-5
+      - codex/supervisor-app-api-permission-2026-11-08
 
 permissions: {}
 
@@ -15,7 +16,8 @@ jobs:
   haos-supervisor:
     if: >-
       github.repository == 'FernandoFraga86/ha-recording-control' &&
-      github.ref == 'refs/heads/codex/supervisor-app-lab-2026-10-5'
+      (github.ref == 'refs/heads/codex/supervisor-app-lab-2026-10-5' ||
+       github.ref == 'refs/heads/codex/supervisor-app-api-permission-2026-11-08')
     runs-on: ubuntu-24.04
     timeout-minutes: 100
     permissions:
@@ -85,3 +87,4 @@ jobs:
             ${{ runner.temp }}/ha-recording-control-supervisor-lab/lab-events.txt
           if-no-files-found: ignore
           retention-days: 7
+

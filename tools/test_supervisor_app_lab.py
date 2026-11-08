@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import base64
+import inspect
 from pathlib import Path
 import re
 import unittest
@@ -116,6 +117,51 @@ class SupervisorAppLabTests(unittest.TestCase):
         self.assertIn('"media:rw"', candidate)
         self.assertNotIn("boot: manual", candidate)
 
+    def test_permission_lab_changes_only_the_core_api_proxy_grant(self) -> None:
+        original = module.TEMPLATE_PATH.read_text(encoding="utf-8")
+        ordinary = module.candidate_lab_manifest(original)
+        reduced = module.candidate_lab_manifest(original, homeassistant_api=False)
+        self.assertEqual(
+            reduced,
+            ordinary.replace("homeassistant_api: true", "homeassistant_api: false", 1),
+        )
+        self.assertEqual(reduced.count("homeassistant_api: false"), 1)
+        self.assertIn("hassio_api: true", reduced)
+        self.assertIn("ingress: true", reduced)
+        self.assertIn("full_access: false", reduced)
+        self.assertIn(f'image: "{module.GHCR_IMAGE}"', reduced)
+        self.assertIn(f'version: "{module.GHCR_TAG}"', reduced)
+
+    def test_permission_lab_has_positive_core_and_ingress_probes_and_no_reboot(self) -> None:
+        source = inspect.getsource(module.run_permission_lab)
+        self.assertIn("homeassistant_api=False", source)
+        self.assertIn("app_api_from_core", source)
+        self.assertIn("app_core_api_denied", source)
+        self.assertIn("ingress_to_app_api", source)
+        self.assertIn("verify_pulled_image_digest", source)
+        self.assertNotIn("console.reboot()", source)
+        self.assertNotIn("LOCAL_PREVIOUS_SLUG", source)
+
+    def test_permission_checks_do_not_log_core_token_or_ingress_token(self) -> None:
+        source = (
+            inspect.getsource(module.core_api_permission_probe_source)
+            + inspect.getsource(module.app_core_api_denied)
+            + inspect.getsource(module.ingress_to_app_api)
+            + inspect.getsource(module.ingress_probe_source)
+        )
+        self.assertIn("SUPERVISOR_TOKEN", source)
+        self.assertNotIn("log_event(root, token", source)
+        self.assertNotIn("print(access", source)
+        self.assertIn("HTTP 401", inspect.getsource(module.app_core_api_denied))
+
+    def test_permission_probe_sources_are_valid_python_and_fit_guest_shell(self) -> None:
+        core_probe = module.core_api_permission_probe_source()
+        ingress_probe = module.ingress_probe_source("/api/hassio_ingress/lab_token/api/version")
+        compile(core_probe, "core-api-permission-probe", "exec")
+        compile(ingress_probe, "ingress-permission-probe", "exec")
+        self.assertLess(len("docker exec candidate python3 -c " + __import__("shlex").quote(core_probe)), 1024)
+        self.assertLess(len("docker exec homeassistant python3 -c " + __import__("shlex").quote(ingress_probe)), 1024)
+
     def test_bad_or_drifted_template_fails_closed(self) -> None:
         with self.assertRaises(module.LabFailure):
             module.candidate_lab_manifest("name: incomplete\n")
@@ -156,6 +202,7 @@ class SupervisorAppLabTests(unittest.TestCase):
     def test_workflow_is_branch_scoped_and_has_capacity_gate_before_apt(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "supervisor-app-lab.yml").read_text(encoding="utf-8")
         self.assertIn("codex/supervisor-app-lab-2026-10-5", workflow)
+        self.assertIn(module.PERMISSION_LAB_BRANCH, workflow)
         self.assertLess(workflow.index("Preflight remote runner"), workflow.index("apt-get update"))
         self.assertIn("/dev/kvm", workflow)
         self.assertIn("40 * 1024 * 1024 * 1024", workflow)
@@ -197,9 +244,12 @@ class SupervisorAppLabTests(unittest.TestCase):
     def test_core_to_app_probe_uses_pinned_frigate_api_version_path(self) -> None:
         source = (ROOT / "tools" / "supervisor_app_lab.py").read_text(encoding="utf-8")
         self.assertIn('"http://{address}:5000/api/version"', source)
+        self.assertIn('base+"version"', source)
+        self.assertIn('base+"config"', source)
         self.assertIn("Frigate /api/version response", source)
         self.assertNotIn('"http://{address}:5000/version"', source)
 
 
 if __name__ == "__main__":
     unittest.main()
+

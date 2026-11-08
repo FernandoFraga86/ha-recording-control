@@ -38,6 +38,8 @@ OFFICIAL_AMD64_DIGEST = "sha256:9ebab4801be69ab4ebc7f6ab1d582c859ff7412d457a3fa5
 LOCAL_REPOSITORY_PATH = "/mnt/data/supervisor/apps/local"
 LOCAL_CANDIDATE_SLUG = "local_recording_control"
 LOCAL_PREVIOUS_SLUG = "local_recording_control_previous"
+FULL_LAB_BRANCH = "codex/supervisor-app-lab-2026-10-5"
+PERMISSION_LAB_BRANCH = "codex/supervisor-app-api-permission-2026-11-08"
 PROMPT = "__HA_RECORDING_CONTROL_LAB_PROMPT__"
 MAX_GUEST_COMMAND_CHARS = 1024
 LOGIN_PROMPT = "homeassistant login: "
@@ -90,7 +92,7 @@ def _run_root() -> Path:
     return root
 
 
-def candidate_lab_manifest(template_text: str) -> str:
+def candidate_lab_manifest(template_text: str, *, homeassistant_api: bool = True) -> str:
     """Create a test-only manifest from the reviewed template with explicit lab overrides."""
     required_fragments = (
         'slug: recording_control',
@@ -130,8 +132,20 @@ def candidate_lab_manifest(template_text: str) -> str:
         raise LabFailure("could not apply the documented lab-only hardware-device exclusion")
     lab = lab.replace("usb: true", "usb: false", 1)
     lab = lab.replace("video: true", "video: false", 1)
+    if not homeassistant_api:
+        lab, api_replacements = re.subn(
+            r"(?m)^homeassistant_api: true$",
+            "homeassistant_api: false",
+            lab,
+            count=1,
+        )
+        if api_replacements != 1:
+            raise LabFailure("could not apply the single lab-only Home Assistant API permission reduction")
     if "boot: manual" in lab or "boot: auto" not in lab:
         raise LabFailure("lab-only boot:auto override did not apply exactly")
+    expected_core_api_permission = f"homeassistant_api: {str(homeassistant_api).lower()}"
+    if lab.count(expected_core_api_permission) != 1:
+        raise LabFailure("lab manifest does not contain exactly the requested Home Assistant API permission")
     if f'image: "{GHCR_IMAGE}"' not in lab or f'version: "{GHCR_TAG}"' not in lab:
         raise LabFailure("lab overlay changed the reviewed image tag/reference")
     return lab
@@ -654,6 +668,24 @@ def store_local_manifests(console: HAOSConsole, root: Path) -> None:
     )
 
 
+def store_permission_lab_manifest(console: HAOSConsole, root: Path) -> None:
+    template = TEMPLATE_PATH.read_text(encoding="utf-8")
+    candidate = candidate_lab_manifest(template, homeassistant_api=False)
+    guest_write(console, f"{LOCAL_REPOSITORY_PATH}/recording_control/config.yaml", candidate)
+    guest_write(console, "/mnt/data/supervisor/app_configs/local_recording_control/config.yml", synthetic_frigate_config())
+    reload_output = console.run("ha store reload --no-progress", timeout=180)
+    if "Command completed successfully." not in reload_output:
+        raise LabFailure("Supervisor CLI did not positively report local permission-lab store reload success")
+    info = cli_info(console, LOCAL_CANDIDATE_SLUG)
+    if info.get("slug") != LOCAL_CANDIDATE_SLUG or info.get("available") is not True:
+        raise LabFailure("Supervisor permission-lab entry is not available after store reload")
+    if info.get("version_latest") != GHCR_TAG:
+        raise LabFailure("Supervisor permission-lab entry resolved an unexpected image version")
+    if info.get("homeassistant_api") is not False:
+        raise LabFailure("Supervisor did not load the explicitly disabled Core API permission")
+    log_event(root, "Disposable manifest loaded with homeassistant_api:false; all other reviewed grants remain unchanged.")
+
+
 def verify_local_store_entries(console: HAOSConsole, root: Path) -> None:
     expected = (
         (LOCAL_PREVIOUS_SLUG, OFFICIAL_TAG),
@@ -707,7 +739,14 @@ def inspect_container(console: HAOSConsole, container_id: str) -> dict[str, Any]
     return result[0]
 
 
-def verify_candidate_metadata(console: HAOSConsole, info: dict[str, Any], container: dict[str, Any], root: Path) -> None:
+def verify_candidate_metadata(
+    console: HAOSConsole,
+    info: dict[str, Any],
+    container: dict[str, Any],
+    root: Path,
+    *,
+    homeassistant_api: bool = True,
+) -> None:
     expected = {
         "state": "started",
         "version": GHCR_TAG,
@@ -715,7 +754,7 @@ def verify_candidate_metadata(console: HAOSConsole, info: dict[str, Any], contai
         "startup": "application",
         "ingress": True,
         "ingress_port": 5000,
-        "homeassistant_api": True,
+        "homeassistant_api": homeassistant_api,
         "hassio_api": True,
         "full_access": False,
         "usb": False,
@@ -755,7 +794,7 @@ def verify_candidate_metadata(console: HAOSConsole, info: dict[str, Any], contai
         raise LabFailure("Docker did not receive the declared PERFMON capability")
     log_event(
         root,
-        "Supervisor effective metadata verified: ingress, API grants, explicit port bindings, writable media/config/homeassistant mounts, no host network/full access, and PERFMON.",
+        f"Supervisor effective metadata verified: ingress, homeassistant_api={homeassistant_api}, remaining API grants, explicit port bindings, writable media/config/homeassistant mounts, no host network/full access, and PERFMON.",
     )
 
 
@@ -789,16 +828,33 @@ def ingress_metadata_diagnostics(info: dict[str, Any]) -> str:
     )
 
 
-def app_api_from_core(console: HAOSConsole, container_id: str, root: Path) -> None:
+def app_api_from_core(
+    console: HAOSConsole,
+    container_id: str,
+    root: Path,
+    *,
+    verify_synthetic_config: bool = False,
+) -> None:
     inspected = inspect_container(console, container_id)
     network = inspected.get("NetworkSettings", {}).get("Networks", {})
     address = next((entry.get("IPAddress") for entry in network.values() if entry.get("IPAddress")), None)
     if not address:
         raise LabFailure("Supervisor app container has no address on the isolated HA network")
-    python = (
-        "import urllib.request; "
-        f'print(urllib.request.urlopen("http://{address}:5000/api/version", timeout=10).read().decode().strip())'
-    )
+    if verify_synthetic_config:
+        python = (
+            "import json,urllib.request; "
+            f'base="http://{address}:5000/api/"; '
+            'version=urllib.request.urlopen(base+"version",timeout=10).read().decode().strip(); '
+            'config=json.loads(urllib.request.urlopen(base+"config",timeout=10).read()); '
+            'record=config.get("record"); '
+            'assert isinstance(record,dict) and record.get("enabled") is False; '
+            'print(version+" synthetic_record_disabled")'
+        )
+    else:
+        python = (
+            "import urllib.request; "
+            f'print(urllib.request.urlopen("http://{address}:5000/api/version", timeout=10).read().decode().strip())'
+        )
     output = docker_output(
         console,
         f"docker exec homeassistant python3 -c {shlex.quote(python)}",
@@ -806,8 +862,62 @@ def app_api_from_core(console: HAOSConsole, container_id: str, root: Path) -> No
     )
     version_lines = [line.strip() for line in output.splitlines() if re.match(r"^0\.18\.2(?:[-.]|$)", line.strip())]
     if not version_lines:
+        if verify_synthetic_config:
+            raise LabFailure("HA Core could not retrieve the synthetic Frigate API/config with recording disabled")
         raise LabFailure("HA Core could not retrieve the synthetic Frigate /api/version response")
-    log_event(root, "HA Core container reached the Supervisor-managed Frigate API over the app network.")
+    event = (
+        "HA Core reached the app API and confirmed the synthetic config has recording disabled."
+        if verify_synthetic_config
+        else "HA Core container reached the Supervisor-managed Frigate API over the app network."
+    )
+    log_event(root, event)
+
+
+def core_api_permission_probe_source() -> str:
+    return (
+        "import os,urllib.error,urllib.request; "
+        'token=os.environ.get("SUPERVISOR_TOKEN"); '
+        'assert token; '
+        'supervisor=urllib.request.urlopen(urllib.request.Request("http://supervisor/info",headers={"Authorization":"Bearer "+token}),timeout=10).status; '
+        'assert supervisor==200; '
+        'request=urllib.request.Request("http://supervisor/core/api/config",headers={"Authorization":"Bearer "+token}); '
+        'status=None; '
+        'exec("try:\\n response=urllib.request.urlopen(request,timeout=10); status=response.status\\nexcept urllib.error.HTTPError as error:\\n status=error.code"); '
+        'print("supervisor_status="+str(supervisor)+" core_api_status="+str(status))'
+    )
+
+
+def app_core_api_denied(console: HAOSConsole, container_id: str, root: Path) -> None:
+    python = core_api_permission_probe_source()
+    output = docker_output(console, f"docker exec {container_id} python3 -c {shlex.quote(python)}", timeout=45)
+    if "supervisor_status=200 core_api_status=401" not in output:
+        raise LabFailure("Core API proxy was not denied after the app's Supervisor token was independently accepted")
+    log_event(root, "Valid app token reached Supervisor /info (HTTP 200); Core API proxy denied the app with HTTP 401.")
+
+
+def ingress_probe_source(ingress_path: str) -> str:
+    return (
+        "import json,secrets,urllib.parse as p,urllib.request as u; "
+        'b="http://127.0.0.1:8123"; c="http://home-assistant.io"; '
+        'x={"name":"Lab","username":"l"+secrets.token_hex(4),"password":secrets.token_hex(16),"client_id":c,"language":"en"}; '
+        'a=json.loads(u.urlopen(u.Request(b+"/api/onboarding/users",data=json.dumps(x).encode(),headers={"Content-Type":"application/json"}),timeout=15).read())["auth_code"]; '
+        'f=p.urlencode({"grant_type":"authorization_code","code":a,"client_id":c}).encode(); '
+        't=json.loads(u.urlopen(u.Request(b+"/auth/token",data=f,headers={"Content-Type":"application/x-www-form-urlencoded"}),timeout=15).read())["access_token"]; '
+        f"print(u.urlopen(u.Request(b+{ingress_path!r},headers={{'Authorization':'Bearer '+t}}),timeout=20).read().decode().strip())"
+    )
+
+
+def ingress_to_app_api(console: HAOSConsole, info: dict[str, Any], root: Path) -> None:
+    entry = info.get("ingress_entry")
+    match = re.fullmatch(r"/api/hassio_ingress/([A-Za-z0-9_-]+)", entry) if isinstance(entry, str) else None
+    if not match:
+        raise LabFailure("cannot test ingress because Supervisor did not provide a valid ingress entry")
+    ingress_path = entry + "/api/version"
+    python = ingress_probe_source(ingress_path)
+    output = docker_output(console, f"docker exec homeassistant python3 -c {shlex.quote(python)}", timeout=90)
+    if not any(re.match(r"^0\.18\.2(?:[-.]|$)", line.strip()) for line in output.splitlines()):
+        raise LabFailure("authenticated Home Assistant ingress did not return the pinned Frigate API version")
+    log_event(root, "Authenticated Home Assistant ingress reached the pinned app API; temporary lab account/token were not recorded.")
 
 
 def marker_in_container(console: HAOSConsole, container_id: str, action: str, root: Path) -> None:
@@ -847,11 +957,99 @@ def wait_after_reboot(console: HAOSConsole, root: Path) -> None:
     raise LabFailure(f"candidate did not auto-recover after guest reboot; last state={last_state!r}")
 
 
-def run_lab() -> None:
+def run_permission_lab() -> None:
     if os.environ.get("GITHUB_REPOSITORY") != "FernandoFraga86/ha-recording-control":
         raise LabFailure("refusing to run outside the authorized repository")
-    if os.environ.get("GITHUB_REF_NAME") != "codex/supervisor-app-lab-2026-10-5":
-        raise LabFailure("refusing to run outside the dedicated lab branch")
+    if os.environ.get("GITHUB_REF_NAME") != PERMISSION_LAB_BRANCH:
+        raise LabFailure("refusing to run the permission test outside its dedicated branch")
+    root = _run_root()
+    validate_distribution_lock()
+    log_event(root, "Permission-only lab started; production/installability gates remain false.")
+    verify_registry_tags(root)
+
+    try:
+        import pexpect
+    except ImportError as err:
+        raise LabFailure("runner lacks the pexpect package installed by the lab workflow") from err
+
+    archive = verify_haos_release(root)
+    image = extract_haos(archive, root)
+    console = HAOSConsole(image, root, pexpect)
+    try:
+        log_event(root, "Booting a fresh disposable HAOS guest for the single API-permission test.")
+        console.boot_login()
+        wait_for_supervisor(console, root)
+
+        store_permission_lab_manifest(console, root)
+        app_info = install_start(console, LOCAL_CANDIDATE_SLUG, root)
+        candidate_container = container_for_image(console, GHCR_IMAGE + ":")
+        verify_pulled_image_digest(console, GHCR_IMAGE + ":" + GHCR_TAG, {GHCR_DIGEST})
+        app_info = cli_info(console, LOCAL_CANDIDATE_SLUG)
+        candidate_container_data = inspect_container(console, candidate_container[0])
+        verify_candidate_metadata(
+            console,
+            app_info,
+            candidate_container_data,
+            root,
+            homeassistant_api=False,
+        )
+        if app_info.get("state") != "started":
+            raise LabFailure("candidate did not remain started with homeassistant_api:false")
+
+        app_api_from_core(console, candidate_container[0], root, verify_synthetic_config=True)
+        app_core_api_denied(console, candidate_container[0], root)
+        ingress_to_app_api(console, app_info, root)
+
+        # Re-resolve the tag after Supervisor pulled it to detect tag drift/TOCTOU.
+        if registry_manifest_digest(GHCR_IMAGE, GHCR_TAG) != GHCR_DIGEST:
+            raise LabFailure("candidate GHCR tag changed during the permission-only Supervisor test")
+        log_event(root, "Post-pull GHCR tag remains bound to the pinned digest.")
+
+        console.json_command(f"ha apps stop {LOCAL_CANDIDATE_SLUG} --no-progress --raw-json", timeout=600)
+        wait_for_app_quiesced(console, LOCAL_CANDIDATE_SLUG, candidate_container[0], root, timeout=300)
+        assert_single_writer(console, None)
+
+        summary = {
+            "status": "passed_disposable_homeassistant_api_permission_test",
+            "haos_release": HAOS_VERSION,
+            "supervisor_version": SUPERVISOR_VERSION,
+            "candidate_image": f"{GHCR_IMAGE}:{GHCR_TAG}",
+            "candidate_digest": GHCR_DIGEST,
+            "candidate_app_slug": LOCAL_CANDIDATE_SLUG,
+            "homeassistant_api": False,
+            "hassio_api": True,
+            "full_access": False,
+            "core_to_app_api": "passed; synthetic Frigate config reported record.enabled=false",
+            "app_to_core_api_proxy": "denied with HTTP 401 after the same Supervisor token received HTTP 200 from /info",
+            "authenticated_ingress_to_app_api": "passed; token and disposable account not recorded",
+            "mqtt": "disabled in synthetic Frigate configuration",
+            "camera_feeds": "none",
+            "household_endpoints": "none",
+            "reboot_or_migration_test": False,
+            "production_ready": False,
+            "installable": False,
+            "native_recovery_enabled": False,
+            "notices": [
+                "Only the homeassistant_api permission was reduced from the reviewed template; other grants and the exact published image digest were preserved.",
+                "The test proves behavior only in a fresh disposable HAOS/Supervisor lab and does not alter the household manifest.",
+                "It does not validate household configuration, camera privacy, hardware acceleration, physical behavior, or production rollback.",
+            ],
+        }
+        (root / "lab-summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        log_event(root, "PERMISSION LAB PASS: app started with Core API proxy disabled; Core-to-app API, authenticated ingress, and app-to-Core denial verified.")
+    finally:
+        console.close()
+
+
+def run_lab() -> None:
+    branch = os.environ.get("GITHUB_REF_NAME")
+    if branch == PERMISSION_LAB_BRANCH:
+        run_permission_lab()
+        return
+    if branch != FULL_LAB_BRANCH:
+        raise LabFailure("refusing to run outside an explicitly authorized disposable lab branch")
+    if os.environ.get("GITHUB_REPOSITORY") != "FernandoFraga86/ha-recording-control":
+        raise LabFailure("refusing to run outside the authorized repository")
     root = _run_root()
     validate_distribution_lock()
     log_event(root, "Distribution lock checked; all production/installability gates remain false.")
@@ -989,3 +1187,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
